@@ -1,10 +1,10 @@
 //! A compact binary encoding of the black-serde data model.
 //!
-//! Layout: the magic bytes `BSRD`, a version byte (1), then one value. Each value is a tag byte
-//! followed by its payload. Lengths and integers are LEB128 varints; signed integers are
-//! zigzag-encoded first.
+//! Layout: magic bytes (`BSRD` by default), a version byte (2), then one value. Each value is a
+//! tag byte followed by its payload. Lengths and integers are LEB128 varints; signed integers
+//! are zigzag-encoded first.
 //!
-//! | tag | value | payload |
+//! | tag (default) | value | payload |
 //! | --- | --- | --- |
 //! | 0 | null | none |
 //! | 1 / 2 | false / true | none |
@@ -14,47 +14,159 @@
 //! | 6 | string | varint length, UTF-8 bytes |
 //! | 7 | bytes | varint length, raw bytes |
 //! | 8 | sequence | varint count, values |
-//! | 9 | map | varint count, (varint key length, UTF-8 key, value) pairs |
+//! | 9 | map | varint count, (key value, value) pairs |
+//! | 10 | tagged | varint length, UTF-8 tag, value |
+//!
+//! Version 1 data, where map keys were bare strings (varint length and UTF-8 bytes) and there
+//! were no tagged values, still decodes.
+//!
+//! The magic bytes and every tag byte come from [`BinaryTokens`] and can be changed.
 
-use crate::{Deserialize, Error, Format, Serialize, Value};
+use crate::{Deserialize, Error, Format, Limits, Serialize, Value, walk};
 
 pub const MAGIC: &[u8; 4] = b"BSRD";
-pub const VERSION: u8 = 1;
-/// Nesting deeper than this is rejected, so hostile input can't overflow the stack.
-pub const MAX_DEPTH: usize = 256;
+pub const VERSION: u8 = 2;
+/// The default limit on nesting; see [`Limits`]. It leaves room to spare on a 1 MB stack (a
+/// Windows main thread) even in a debug build.
+pub const MAX_DEPTH: usize = 128;
 
-const NULL: u8 = 0;
-const FALSE: u8 = 1;
-const TRUE: u8 = 2;
-const INT: u8 = 3;
-const UINT: u8 = 4;
-const FLOAT: u8 = 5;
-const STRING: u8 = 6;
-const BYTES: u8 = 7;
-const SEQ: u8 = 8;
-const MAP: u8 = 9;
+/// The magic bytes and the tag byte of each kind of value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BinaryTokens {
+    pub magic: &'static [u8],
+    pub null: u8,
+    pub bool_false: u8,
+    pub bool_true: u8,
+    pub int: u8,
+    pub uint: u8,
+    pub float: u8,
+    pub string: u8,
+    pub bytes: u8,
+    pub seq: u8,
+    pub map: u8,
+    pub tagged: u8,
+}
+
+impl BinaryTokens {
+    pub const STANDARD: BinaryTokens = BinaryTokens {
+        magic: MAGIC,
+        null: 0,
+        bool_false: 1,
+        bool_true: 2,
+        int: 3,
+        uint: 4,
+        float: 5,
+        string: 6,
+        bytes: 7,
+        seq: 8,
+        map: 9,
+        tagged: 10,
+    };
+
+    fn tags(&self) -> [(&'static str, u8); 11] {
+        [
+            ("null", self.null),
+            ("bool_false", self.bool_false),
+            ("bool_true", self.bool_true),
+            ("int", self.int),
+            ("uint", self.uint),
+            ("float", self.float),
+            ("string", self.string),
+            ("bytes", self.bytes),
+            ("seq", self.seq),
+            ("map", self.map),
+            ("tagged", self.tagged),
+        ]
+    }
+
+    /// Check that the set can be read back unambiguously: every tag byte is different.
+    pub fn check(&self) -> Result<(), Error> {
+        if self.magic.is_empty() {
+            return Err(Error::new("binary token magic can't be empty"));
+        }
+        let tags = self.tags();
+        for (i, (na, a)) in tags.iter().enumerate() {
+            if let Some((nb, _)) = tags[i + 1..].iter().find(|(_, b)| b == a) {
+                return Err(Error::new(format!("binary tokens {na} and {nb} are both {a}, so they can't be told apart")));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for BinaryTokens {
+    fn default() -> Self {
+        BinaryTokens::STANDARD
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Binary;
+pub struct Binary {
+    tokens: BinaryTokens,
+    limits: Option<Limits>,
+}
+
+impl Binary {
+    pub fn new() -> Self {
+        Binary::default()
+    }
+
+    /// Use a different token set, after checking it.
+    pub fn with_tokens(mut self, tokens: BinaryTokens) -> Result<Self, Error> {
+        tokens.check()?;
+        self.tokens = tokens;
+        Ok(self)
+    }
+
+    /// Use these limits instead of the defaults and environment variables.
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// The limits decoding uses: those set with [`with_limits`](Binary::with_limits), or else
+    /// the defaults with any environment variables applied.
+    pub fn limits(&self) -> Result<Limits, Error> {
+        self.limits.map_or_else(|| Limits::from_env("BINARY", Limits::BINARY), Ok)
+    }
+
+    pub fn tokens(&self) -> &BinaryTokens {
+        &self.tokens
+    }
+}
 
 impl Format for Binary {
-    fn encode(&self, value: &Value) -> Vec<u8> {
+    /// Fails only if the value is nested deeper than `max_depth`: binary represents the
+    /// whole data model.
+    fn encode(&self, value: &Value) -> Result<Vec<u8>, Error> {
+        let t = &self.tokens;
+        let max_depth = self.limits()?.max_depth;
         let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(t.magic);
         out.push(VERSION);
-        write_value(&mut out, value);
-        out
+        // The layout is the values in depth-first order, each container followed by its
+        // contents, so walking the tree in that order and writing each header is the encoding.
+        walk(value, max_depth, "BINARY", |v| {
+            write_header(&mut out, v, t);
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     fn decode(&self, input: &[u8]) -> Result<Value, Error> {
-        if input.len() < 5 || &input[..4] != MAGIC {
+        let limits = self.limits()?;
+        limits.check_input(input.len(), "BINARY")?;
+        let t = &self.tokens;
+        let n = t.magic.len();
+        if input.len() <= n || &input[..n] != t.magic {
             return Err(Error::new("not black-serde binary data (bad magic bytes)").at_offset(0));
         }
-        if input[4] != VERSION {
-            return Err(Error::new(format!("unsupported binary format version {}", input[4])).at_offset(4));
+        let version = input[n];
+        if version != 1 && version != VERSION {
+            return Err(Error::new(format!("unsupported binary format version {version}")).at_offset(n));
         }
-        let mut r = Reader { src: input, pos: 5 };
-        let v = r.value(0)?;
+        let mut r = Reader { src: input, pos: n + 1, t, version, max_depth: limits.max_depth };
+        let v = r.value()?;
         if r.pos != input.len() {
             return Err(Error::new("trailing bytes after the value").at_offset(r.pos));
         }
@@ -62,12 +174,12 @@ impl Format for Binary {
     }
 }
 
-pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Vec<u8> {
-    Binary.encode(&value.serialize())
+pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, Error> {
+    Binary::default().encode(&value.serialize())
 }
 
 pub fn from_slice<T: Deserialize>(input: &[u8]) -> Result<T, Error> {
-    T::deserialize(&Binary.decode(input)?)
+    T::deserialize(&Binary::default().decode(input)?)
 }
 
 fn write_varint(out: &mut Vec<u8>, mut n: u64) {
@@ -90,48 +202,50 @@ fn unzigzag(u: u64) -> i64 {
     ((u >> 1) as i64) ^ -((u & 1) as i64)
 }
 
-fn write_value(out: &mut Vec<u8>, v: &Value) {
+fn write_str(out: &mut Vec<u8>, s: &str) {
+    write_varint(out, s.len() as u64);
+    out.extend_from_slice(s.as_bytes());
+}
+
+/// The bytes written for `v` itself: a scalar in full, or a container's tag and count (its
+/// contents follow as the next values).
+fn write_header(out: &mut Vec<u8>, v: &Value, t: &BinaryTokens) {
     match v {
-        Value::Null => out.push(NULL),
-        Value::Bool(false) => out.push(FALSE),
-        Value::Bool(true) => out.push(TRUE),
+        Value::Null => out.push(t.null),
+        Value::Bool(false) => out.push(t.bool_false),
+        Value::Bool(true) => out.push(t.bool_true),
         Value::Int(i) => {
-            out.push(INT);
+            out.push(t.int);
             write_varint(out, zigzag(*i));
         }
         Value::UInt(u) => {
-            out.push(UINT);
+            out.push(t.uint);
             write_varint(out, *u);
         }
         Value::Float(f) => {
-            out.push(FLOAT);
+            out.push(t.float);
             out.extend_from_slice(&f.to_le_bytes());
         }
         Value::String(s) => {
-            out.push(STRING);
-            write_varint(out, s.len() as u64);
-            out.extend_from_slice(s.as_bytes());
+            out.push(t.string);
+            write_str(out, s);
         }
         Value::Bytes(b) => {
-            out.push(BYTES);
+            out.push(t.bytes);
             write_varint(out, b.len() as u64);
             out.extend_from_slice(b);
         }
         Value::Seq(items) => {
-            out.push(SEQ);
+            out.push(t.seq);
             write_varint(out, items.len() as u64);
-            for item in items {
-                write_value(out, item);
-            }
         }
         Value::Map(pairs) => {
-            out.push(MAP);
+            out.push(t.map);
             write_varint(out, pairs.len() as u64);
-            for (k, item) in pairs {
-                write_varint(out, k.len() as u64);
-                out.extend_from_slice(k.as_bytes());
-                write_value(out, item);
-            }
+        }
+        Value::Tagged(tag, _) => {
+            out.push(t.tagged);
+            write_str(out, tag);
         }
     }
 }
@@ -139,6 +253,9 @@ fn write_value(out: &mut Vec<u8>, v: &Value) {
 struct Reader<'a> {
     src: &'a [u8],
     pos: usize,
+    t: &'a BinaryTokens,
+    version: u8,
+    max_depth: usize,
 }
 
 impl Reader<'_> {
@@ -199,45 +316,121 @@ impl Reader<'_> {
         String::from_utf8(bytes.to_vec()).map_err(|e| Error::new("string is not valid UTF-8").at_offset(start + e.utf8_error().valid_up_to()))
     }
 
-    fn value(&mut self, depth: usize) -> Result<Value, Error> {
-        if depth > MAX_DEPTH {
-            return Err(self.err("nested too deeply"));
+    /// One complete value. Open containers are kept on a heap stack rather than by recursing,
+    /// so nesting is limited only by `max_depth`. Depth counts sequences and maps; tags don't
+    /// add to it.
+    fn value(&mut self) -> Result<Value, Error> {
+        enum Open {
+            Seq(Vec<Value>, usize),
+            /// Pairs so far, how many there are, and a key waiting for its value.
+            Map(Vec<(Value, Value)>, usize, Option<Value>),
+            Tagged(String),
         }
-        let tag_pos = self.pos;
-        Ok(match self.byte()? {
-            NULL => Value::Null,
-            FALSE => Value::Bool(false),
-            TRUE => Value::Bool(true),
-            INT => Value::Int(unzigzag(self.varint()?)),
-            UINT => Value::UInt(self.varint()?),
-            FLOAT => Value::Float(f64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes"))),
-            STRING => Value::String(self.string()?),
-            BYTES => {
+        let t = self.t;
+        let mut stack: Vec<Open> = Vec::new();
+        let mut depth = 0;
+        loop {
+            if depth > self.max_depth {
+                return Err(self.too_deep());
+            }
+            let tag_pos = self.pos;
+            let tag = self.byte()?;
+            let mut v = if tag == t.seq {
+                let n = self.len()?;
+                if n > 0 {
+                    stack.push(Open::Seq(Vec::with_capacity(n), n));
+                    depth += 1;
+                    continue;
+                }
+                Value::Seq(Vec::new())
+            } else if tag == t.map {
+                let n = self.len()?;
+                if n > 0 {
+                    // Version 1 keys are bare strings, read here rather than as values.
+                    let key = if self.version == 1 { Some(self.string_value()?) } else { None };
+                    stack.push(Open::Map(Vec::with_capacity(n), n, key));
+                    depth += 1;
+                    continue;
+                }
+                Value::Map(Vec::new())
+            } else if tag == t.tagged && self.version >= 2 {
+                let name = self.string()?;
+                stack.push(Open::Tagged(name));
+                continue;
+            } else {
+                self.scalar(tag, tag_pos)?
+            };
+            // Add it to the innermost open container, closing containers that are complete.
+            loop {
+                match stack.last_mut() {
+                    None => return Ok(v),
+                    Some(Open::Seq(items, n)) => {
+                        items.push(v);
+                        if items.len() < *n {
+                            break;
+                        }
+                        let Some(Open::Seq(items, _)) = stack.pop() else { unreachable!() };
+                        depth -= 1;
+                        v = Value::Seq(items);
+                    }
+                    Some(Open::Map(pairs, n, key)) => match key.take() {
+                        None => {
+                            *key = Some(v);
+                            break;
+                        }
+                        Some(k) => {
+                            pairs.push((k, v));
+                            if pairs.len() < *n {
+                                if self.version == 1 {
+                                    *key = Some(self.string_value()?);
+                                }
+                                break;
+                            }
+                            let Some(Open::Map(pairs, ..)) = stack.pop() else { unreachable!() };
+                            depth -= 1;
+                            v = Value::Map(pairs);
+                        }
+                    },
+                    Some(Open::Tagged(_)) => {
+                        let Some(Open::Tagged(name)) = stack.pop() else { unreachable!() };
+                        v = Value::Tagged(name, Box::new(v));
+                    }
+                }
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn string_value(&mut self) -> Result<Value, Error> {
+        self.string().map(Value::String)
+    }
+
+    #[inline(never)]
+    fn scalar(&mut self, tag: u8, tag_pos: usize) -> Result<Value, Error> {
+        let t = self.t;
+        Ok(match tag {
+            _ if tag == t.null => Value::Null,
+            _ if tag == t.bool_false => Value::Bool(false),
+            _ if tag == t.bool_true => Value::Bool(true),
+            _ if tag == t.int => Value::Int(unzigzag(self.varint()?)),
+            _ if tag == t.uint => Value::UInt(self.varint()?),
+            _ if tag == t.float => Value::Float(f64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes"))),
+            _ if tag == t.string => Value::String(self.string()?),
+            _ if tag == t.bytes => {
                 let n = self.len()?;
                 Value::Bytes(self.take(n)?.to_vec())
             }
-            SEQ => {
-                let n = self.len()?;
-                let mut items = Vec::with_capacity(n);
-                for _ in 0..n {
-                    items.push(self.value(depth + 1)?);
-                }
-                Value::Seq(items)
-            }
-            MAP => {
-                let n = self.len()?;
-                let mut pairs = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let k = self.string()?;
-                    pairs.push((k, self.value(depth + 1)?));
-                }
-                Value::Map(pairs)
-            }
-            tag => {
+            _ => {
                 self.pos = tag_pos;
                 return Err(self.err(&format!("unknown tag {tag}")));
             }
         })
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn too_deep(&self) -> Error {
+        Limits { max_depth: self.max_depth, ..Limits::BINARY }.depth_error("BINARY").at_offset(self.pos)
     }
 }
 
@@ -246,25 +439,37 @@ mod tests {
     use super::*;
 
     fn every_kind() -> Value {
-        Value::map([
-            ("null", Value::Null),
-            ("bools", Value::Seq(vec![Value::Bool(true), Value::Bool(false)])),
-            ("ints", Value::Seq(vec![Value::Int(0), Value::Int(-1), Value::Int(i64::MIN), Value::Int(i64::MAX)])),
-            ("uint", Value::UInt(u64::MAX)),
-            ("floats", Value::Seq(vec![Value::Float(1.5), Value::Float(-0.0), Value::Float(f64::INFINITY)])),
-            ("string", Value::from("h\u{e9}llo \u{1F600}")),
-            ("bytes", Value::Bytes(vec![0, 1, 2, 255])),
-            ("empty", Value::Map(vec![])),
+        Value::Map(vec![
+            (Value::from("null"), Value::Null),
+            (Value::from("bools"), Value::Seq(vec![Value::Bool(true), Value::Bool(false)])),
+            (Value::from("ints"), Value::Seq(vec![Value::Int(0), Value::Int(-1), Value::Int(i64::MIN), Value::Int(i64::MAX)])),
+            (Value::from("uint"), Value::UInt(u64::MAX)),
+            (Value::from("floats"), Value::Seq(vec![Value::Float(1.5), Value::Float(-0.0), Value::Float(f64::INFINITY)])),
+            (Value::from("string"), Value::from("h\u{e9}llo \u{1F600}")),
+            (Value::from("bytes"), Value::Bytes(vec![0, 1, 2, 255])),
+            (Value::from("empty"), Value::Map(vec![])),
+            (Value::Seq(vec![Value::Int(1), Value::Null]), Value::tagged("!point", Value::map([("x", Value::Int(1))]))),
+            (Value::Int(7), Value::from("int key")),
         ])
     }
 
     #[test]
     fn round_trip() {
+        let b = Binary::new();
         let v = every_kind();
-        assert_eq!(Binary.decode(&Binary.encode(&v)).unwrap(), v);
+        assert_eq!(b.decode(&b.encode(&v).unwrap()).unwrap(), v);
         // NaN never equals itself, so check it separately.
-        let nan = Binary.decode(&Binary.encode(&Value::Float(f64::NAN))).unwrap();
+        let nan = b.decode(&b.encode(&Value::Float(f64::NAN)).unwrap()).unwrap();
         assert!(matches!(nan, Value::Float(f) if f.is_nan()));
+    }
+
+    #[test]
+    fn reads_version_1() {
+        // {"a": 5} as version 1 wrote it: the key is a bare string.
+        let v1 = b"BSRD\x01\x09\x01\x01a\x03\x0A";
+        assert_eq!(Binary::new().decode(v1).unwrap(), Value::map([("a", Value::Int(5))]));
+        // Version 1 had no tagged values.
+        assert!(Binary::new().decode(b"BSRD\x01\x0A\x01t\x00").is_err());
     }
 
     #[test]
@@ -275,39 +480,63 @@ mod tests {
         let mut out = Vec::new();
         write_varint(&mut out, 300);
         assert_eq!(out, [0xAC, 0x02]);
-        let mut r = Reader { src: &[0xFF; 11], pos: 0 };
+        let t = BinaryTokens::STANDARD;
+        let mut r = Reader { src: &[0xFF; 11], pos: 0, t: &t, version: VERSION, max_depth: MAX_DEPTH };
         assert!(r.varint().is_err());
     }
 
     #[test]
     fn compact() {
-        assert_eq!(Binary.encode(&Value::Int(5)), b"BSRD\x01\x03\x0A");
+        assert_eq!(Binary::new().encode(&Value::Int(5)).unwrap(), b"BSRD\x02\x03\x0A");
+    }
+
+    #[test]
+    fn swapped_tokens() {
+        let tokens = BinaryTokens { magic: b"MINE", int: 0xF0, map: 0x7B, string: b's', ..BinaryTokens::STANDARD };
+        let b = Binary::new().with_tokens(tokens).unwrap();
+        assert_eq!(b.encode(&Value::Int(5)).unwrap(), b"MINE\x02\xF0\x0A");
+        let v = every_kind();
+        let bytes = b.encode(&v).unwrap();
+        assert_eq!(b.decode(&bytes).unwrap(), v);
+        // The standard reader doesn't accept it, and vice versa.
+        assert!(Binary::new().decode(&bytes).is_err());
+        assert!(b.decode(&Binary::new().encode(&v).unwrap()).is_err());
+
+        let clash = BinaryTokens { seq: 3, ..BinaryTokens::STANDARD };
+        let e = clash.check().unwrap_err().to_string();
+        assert!(e.contains("int") && e.contains("seq"), "{e}");
+        assert!(BinaryTokens { magic: b"", ..BinaryTokens::STANDARD }.check().is_err());
     }
 
     #[test]
     fn rejects_bad_input() {
-        let good = Binary.encode(&every_kind());
-        assert!(Binary.decode(b"JSON{}").unwrap_err().to_string().contains("magic"));
-        assert!(Binary.decode(b"BSRD\x09\x00").unwrap_err().to_string().contains("version"));
+        let b = Binary::new();
+        let good = b.encode(&every_kind()).unwrap();
+        assert!(b.decode(b"JSON{}").unwrap_err().to_string().contains("magic"));
+        assert!(b.decode(b"BSRD\x09\x00").unwrap_err().to_string().contains("version"));
         for cut in 5..good.len() {
-            assert!(Binary.decode(&good[..cut]).is_err(), "truncated at {cut} should fail");
+            assert!(b.decode(&good[..cut]).is_err(), "truncated at {cut} should fail");
         }
         let mut trailing = good.clone();
         trailing.push(0);
-        assert!(Binary.decode(&trailing).is_err());
+        assert!(b.decode(&trailing).is_err());
         // A huge count with no data behind it must fail fast, not allocate.
-        assert!(Binary.decode(b"BSRD\x01\x08\xFF\xFF\xFF\xFF\x0F").is_err());
-        assert!(Binary.decode(b"BSRD\x01\x06\x02\xFF\xFE").unwrap_err().to_string().contains("UTF-8"));
-        assert!(Binary.decode(b"BSRD\x01\x63").unwrap_err().to_string().contains("unknown tag 99 at byte 5"));
+        assert!(b.decode(b"BSRD\x02\x08\xFF\xFF\xFF\xFF\x0F").is_err());
+        assert!(b.decode(b"BSRD\x02\x06\x02\xFF\xFE").unwrap_err().to_string().contains("UTF-8"));
+        assert!(b.decode(b"BSRD\x02\x63").unwrap_err().to_string().contains("unknown tag 99 at byte 5"));
     }
 
     #[test]
     fn depth_limit() {
-        let mut deep = b"BSRD\x01".to_vec();
+        let mut deep = b"BSRD\x02".to_vec();
         for _ in 0..MAX_DEPTH + 2 {
-            deep.extend_from_slice(&[SEQ, 1]);
+            deep.extend_from_slice(&[8, 1]);
         }
-        deep.push(NULL);
-        assert!(Binary.decode(&deep).unwrap_err().to_string().contains("nested too deeply"));
+        deep.push(0);
+        assert!(Binary::new().decode(&deep).unwrap_err().to_string().contains("nested too deeply"));
+        assert_eq!(Binary::new().decode(&deep).unwrap_err().limit(), Some(crate::Limit::Depth));
+        let small = Binary::new().with_limits(Limits { max_input_bytes: 6, ..Limits::BINARY });
+        assert!(small.decode(b"BSRD\x02\x00").is_ok());
+        assert_eq!(small.decode(b"BSRD\x02\x03\x0A").unwrap_err().limit(), Some(crate::Limit::InputSize));
     }
 }

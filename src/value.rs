@@ -1,10 +1,14 @@
 //! The format-neutral data model every type serializes into and every format encodes.
 
+use std::hash::{Hash, Hasher};
+
+use crate::Error;
+
 /// A value in the black-serde data model.
 ///
 /// Types turn themselves into a `Value` ([`Serialize`](crate::Serialize)) and back
 /// ([`Deserialize`](crate::Deserialize)); a [`Format`](crate::Format) turns a `Value` into bytes
-/// and back. Maps keep their keys in insertion order.
+/// and back.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
     Null,
@@ -16,18 +20,63 @@ pub enum Value {
     String(String),
     Bytes(Vec<u8>),
     Seq(Vec<Value>),
-    Map(Vec<(String, Value)>),
+    /// Key/value pairs in order. Keys can be any value (YAML allows `? [a, b] : c`); JSON
+    /// writes keys that aren't strings as text.
+    Map(Vec<(Value, Value)>),
+    /// A value with an application tag, such as YAML's `!point {x: 1, y: 2}`. Accessors such as
+    /// [`as_i64`](Value::as_i64) and [`get`](Value::get) look through tags, so a tagged value
+    /// still deserializes as its content.
+    Tagged(String, Box<Value>),
 }
 
 impl Value {
     /// Build a map from key/value pairs, keeping their order.
-    pub fn map<K: Into<String>, const N: usize>(pairs: [(K, Value); N]) -> Value {
+    pub fn map<K: Into<Value>, const N: usize>(pairs: [(K, Value); N]) -> Value {
         Value::Map(pairs.into_iter().map(|(k, v)| (k.into(), v)).collect())
+    }
+
+    pub fn tagged(tag: impl Into<String>, value: Value) -> Value {
+        Value::Tagged(tag.into(), Box::new(value))
+    }
+
+    /// A sequence's items, taken without copying; any other value (including a tagged
+    /// sequence) is given back unchanged. `Value` implements `Drop`, so its contents can't be
+    /// moved out with a pattern; this and [`into_map`](Value::into_map) do it instead.
+    pub fn into_seq(mut self) -> Result<Vec<Value>, Value> {
+        if let Value::Seq(items) = &mut self {
+            return Ok(std::mem::take(items));
+        }
+        Err(self)
+    }
+
+    /// A map's pairs, taken without copying; any other value is given back unchanged.
+    pub fn into_map(mut self) -> Result<Vec<(Value, Value)>, Value> {
+        if let Value::Map(pairs) = &mut self {
+            return Ok(std::mem::take(pairs));
+        }
+        Err(self)
+    }
+
+    /// The value with any tags removed.
+    pub fn untagged(&self) -> &Value {
+        let mut v = self;
+        while let Value::Tagged(_, inner) = v {
+            v = inner;
+        }
+        v
+    }
+
+    /// The outermost tag, if any.
+    pub fn tag(&self) -> Option<&str> {
+        match self {
+            Value::Tagged(t, _) => Some(t),
+            _ => None,
+        }
     }
 
     /// The name of this value's kind, for error messages.
     pub fn kind(&self) -> &'static str {
-        match self {
+        match self.untagged() {
             Value::Null => "null",
             Value::Bool(_) => "a boolean",
             Value::Int(_) | Value::UInt(_) => "an integer",
@@ -36,12 +85,18 @@ impl Value {
             Value::Bytes(_) => "bytes",
             Value::Seq(_) => "a sequence",
             Value::Map(_) => "a map",
+            Value::Tagged(..) => unreachable!("untagged"),
         }
     }
 
-    /// Look up a key in a map. If a key appears more than once, the last one wins.
+    /// Look up a string key in a map. If a key appears more than once, the last one wins.
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.as_map()?.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v)
+        self.as_map()?.iter().rev().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
+    }
+
+    /// Look up any key in a map.
+    pub fn get_key(&self, key: &Value) -> Option<&Value> {
+        self.as_map()?.iter().rev().find(|(k, _)| same(k, key)).map(|(_, v)| v)
     }
 
     /// Look up an index in a sequence.
@@ -49,12 +104,21 @@ impl Value {
         self.as_seq()?.get(index)
     }
 
+    /// A map key as text: strings as they are, other scalars as they'd be written (`1`,
+    /// `true`, `null`), and anything else as compact JSON. Used for JSON keys and error paths.
+    pub fn key_text(&self) -> String {
+        match self.untagged() {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        }
+    }
+
     pub fn is_null(&self) -> bool {
-        matches!(self, Value::Null)
+        matches!(self.untagged(), Value::Null)
     }
 
     pub fn as_bool(&self) -> Option<bool> {
-        match *self {
+        match *self.untagged() {
             Value::Bool(b) => Some(b),
             _ => None,
         }
@@ -62,7 +126,7 @@ impl Value {
 
     /// The value as an `i64`: an integer in range, or a float with no fractional part.
     pub fn as_i64(&self) -> Option<i64> {
-        match *self {
+        match *self.untagged() {
             Value::Int(i) => Some(i),
             Value::UInt(u) => i64::try_from(u).ok(),
             Value::Float(f) if f.fract() == 0.0 && (-9.223_372_036_854_776e18..9.223_372_036_854_776e18).contains(&f) => {
@@ -74,7 +138,7 @@ impl Value {
 
     /// The value as a `u64`: a non-negative integer, or a float with no fractional part.
     pub fn as_u64(&self) -> Option<u64> {
-        match *self {
+        match *self.untagged() {
             Value::Int(i) => u64::try_from(i).ok(),
             Value::UInt(u) => Some(u),
             Value::Float(f) if f.fract() == 0.0 && (0.0..1.844_674_407_370_955_2e19).contains(&f) => Some(f as u64),
@@ -83,7 +147,7 @@ impl Value {
     }
 
     pub fn as_f64(&self) -> Option<f64> {
-        match *self {
+        match *self.untagged() {
             Value::Int(i) => Some(i as f64),
             Value::UInt(u) => Some(u as f64),
             Value::Float(f) => Some(f),
@@ -92,31 +156,197 @@ impl Value {
     }
 
     pub fn as_str(&self) -> Option<&str> {
-        match self {
+        match self.untagged() {
             Value::String(s) => Some(s),
             _ => None,
         }
     }
 
     pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
+        match self.untagged() {
             Value::Bytes(b) => Some(b),
             _ => None,
         }
     }
 
     pub fn as_seq(&self) -> Option<&Vec<Value>> {
-        match self {
+        match self.untagged() {
             Value::Seq(s) => Some(s),
             _ => None,
         }
     }
 
-    pub fn as_map(&self) -> Option<&Vec<(String, Value)>> {
-        match self {
+    pub fn as_map(&self) -> Option<&Vec<(Value, Value)>> {
+        match self.untagged() {
             Value::Map(m) => Some(m),
             _ => None,
         }
+    }
+}
+
+fn is_container(v: &Value) -> bool {
+    matches!(v, Value::Seq(_) | Value::Map(_) | Value::Tagged(..))
+}
+
+/// Dropping nested containers the usual way recurses once per level, so a deep enough value
+/// would overflow the stack just by being freed. Instead, children are moved onto a heap stack
+/// and dropped one at a time.
+impl Drop for Value {
+    fn drop(&mut self) {
+        fn take_children(v: &mut Value, out: &mut Vec<Value>) {
+            match v {
+                Value::Seq(items) => out.append(items),
+                Value::Map(pairs) => {
+                    for (k, item) in pairs.drain(..) {
+                        out.push(k);
+                        out.push(item);
+                    }
+                }
+                Value::Tagged(_, inner) => out.push(std::mem::replace(&mut **inner, Value::Null)),
+                _ => {}
+            }
+        }
+        // Containers of plain scalars, by far the common case, need nothing special.
+        let nested = match self {
+            Value::Seq(items) => items.iter().any(is_container),
+            Value::Map(pairs) => pairs.iter().any(|(k, v)| is_container(k) || is_container(v)),
+            Value::Tagged(_, inner) => is_container(inner),
+            _ => false,
+        };
+        if !nested {
+            return;
+        }
+        let mut stack = Vec::new();
+        take_children(self, &mut stack);
+        while let Some(mut v) = stack.pop() {
+            take_children(&mut v, &mut stack);
+        }
+    }
+}
+
+/// A step in a path, borrowed from the value being walked.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Index(usize),
+    Key(&'a Value),
+}
+
+/// Add `path` (outermost first) to an error about the value at its end.
+fn with_path(mut e: Error, path: &[Step]) -> Error {
+    for step in path.iter().rev() {
+        e = match step {
+            Step::Index(i) => e.in_index(*i),
+            Step::Key(k) => e.in_key(&k.key_text()),
+        };
+    }
+    e
+}
+
+/// Visit every value in `root`, keys included, without recursing. `check` sees each value; an
+/// error from it gets the value's path. A value inside more than `max_depth` sequences and
+/// maps is a depth-limit error for `format`. Tags don't add depth.
+pub(crate) fn walk(
+    root: &Value,
+    max_depth: usize,
+    format: &str,
+    mut check: impl FnMut(&Value) -> Result<(), Error>,
+) -> Result<(), Error> {
+    // (value, depth, path length including this value's own step, its step)
+    let mut stack: Vec<(&Value, usize, usize, Option<Step>)> = vec![(root, 0, 0, None)];
+    let mut path: Vec<Step> = Vec::new();
+    while let Some((v, depth, plen, step)) = stack.pop() {
+        path.truncate(plen - step.is_some() as usize);
+        if let Some(s) = step {
+            path.push(s);
+        }
+        if depth > max_depth {
+            let limits = crate::Limits { max_depth, ..crate::Limits::JSON };
+            return Err(with_path(limits.depth_error(format), &path));
+        }
+        check(v).map_err(|e| with_path(e, &path))?;
+        match v {
+            Value::Seq(items) => {
+                for (i, item) in items.iter().enumerate().rev() {
+                    stack.push((item, depth + 1, plen + 1, Some(Step::Index(i))));
+                }
+            }
+            Value::Map(pairs) => {
+                for (k, item) in pairs.iter().rev() {
+                    stack.push((item, depth + 1, plen + 1, Some(Step::Key(k))));
+                    stack.push((k, depth + 1, plen + 1, Some(Step::Key(k))));
+                }
+            }
+            Value::Tagged(_, inner) => stack.push((inner, depth, plen, None)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Structural equality where floats compare by their bits, so NaN equals itself and `0.0`
+/// differs from `-0.0`. Used for map keys and for finding repeated subtrees.
+pub(crate) fn same(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        (Value::Seq(x), Value::Seq(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b)),
+        (Value::Map(x), Value::Map(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|((ka, va), (kb, vb))| same(ka, kb) && same(va, vb))
+        }
+        (Value::Tagged(ta, a), Value::Tagged(tb, b)) => ta == tb && same(a, b),
+        _ => a == b,
+    }
+}
+
+/// A hash consistent with [`same`].
+pub(crate) fn hash_value<H: Hasher>(v: &Value, h: &mut H) {
+    std::mem::discriminant(v).hash(h);
+    match v {
+        Value::Null => {}
+        Value::Bool(b) => b.hash(h),
+        Value::Int(i) => i.hash(h),
+        Value::UInt(u) => u.hash(h),
+        Value::Float(f) => f.to_bits().hash(h),
+        Value::String(s) => s.hash(h),
+        Value::Bytes(b) => b.hash(h),
+        Value::Seq(items) => {
+            items.len().hash(h);
+            for item in items {
+                hash_value(item, h);
+            }
+        }
+        Value::Map(pairs) => {
+            pairs.len().hash(h);
+            for (k, item) in pairs {
+                hash_value(k, h);
+                hash_value(item, h);
+            }
+        }
+        Value::Tagged(t, inner) => {
+            t.hash(h);
+            hash_value(inner, h);
+        }
+    }
+}
+
+pub(crate) fn key_hash(v: &Value) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    hash_value(v, &mut h);
+    h.finish()
+}
+
+/// Finds keys already in a list of pairs without comparing against every one.
+#[derive(Default)]
+pub(crate) struct KeyIndex {
+    by_hash: std::collections::HashMap<u64, Vec<usize>>,
+}
+
+impl KeyIndex {
+    pub(crate) fn find(&self, pairs: &[(Value, Value)], key: &Value) -> Option<usize> {
+        self.by_hash.get(&key_hash(key))?.iter().copied().find(|&i| same(&pairs[i].0, key))
+    }
+
+    pub(crate) fn insert(&mut self, key: &Value, index: usize) {
+        self.by_hash.entry(key_hash(key)).or_default().push(index);
     }
 }
 

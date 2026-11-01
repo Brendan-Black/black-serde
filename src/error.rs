@@ -18,6 +18,30 @@ pub struct Error {
     message: String,
     path: Vec<Segment>,
     position: Option<Position>,
+    kind: ErrorKind,
+}
+
+/// What sort of problem an [`Error`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ErrorKind {
+    /// The input is wrong: bad syntax, or a value of the wrong type for what's being read.
+    Invalid,
+    /// The input or value went over a configured limit.
+    Limit(Limit),
+    /// The value can't be written in this format without losing something (JSON has no NaN,
+    /// for example). The format's lossy options allow it, with the loss described.
+    Unrepresentable,
+}
+
+/// A configurable limit (see [`Limits`](crate::Limits)) that input went over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Limit {
+    /// Nesting deeper than `max_depth`.
+    Depth,
+    /// Input longer than `max_input_bytes`.
+    InputSize,
+    /// Aliases expanding to more than `max_alias_values`.
+    AliasValues,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +52,29 @@ pub enum Position {
 
 impl Error {
     pub fn new(message: impl Into<String>) -> Self {
-        Error { message: message.into(), path: Vec::new(), position: None }
+        Error { message: message.into(), path: Vec::new(), position: None, kind: ErrorKind::Invalid }
+    }
+
+    /// The input or value went over a configured limit.
+    pub fn limit_exceeded(limit: Limit, message: impl Into<String>) -> Self {
+        Error { kind: ErrorKind::Limit(limit), ..Error::new(message) }
+    }
+
+    /// The value can't be written in this format without losing something.
+    pub fn unrepresentable(message: impl Into<String>) -> Self {
+        Error { kind: ErrorKind::Unrepresentable, ..Error::new(message) }
+    }
+
+    pub fn kind(&self) -> ErrorKind {
+        self.kind
+    }
+
+    /// Which limit was exceeded, if that's what this error is.
+    pub fn limit(&self) -> Option<Limit> {
+        match self.kind {
+            ErrorKind::Limit(l) => Some(l),
+            _ => None,
+        }
     }
 
     /// "expected X, found Y" for a value of the wrong kind.

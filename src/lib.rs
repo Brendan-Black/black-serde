@@ -3,10 +3,14 @@
 //! Three pieces, kept apart so each can change without the others:
 //!
 //! - [`Value`]: a format-neutral data model (null, bool, integers, floats, strings, bytes,
-//!   sequences, maps).
+//!   sequences, maps with any keys, tagged values).
 //! - [`Serialize`] / [`Deserialize`]: how a Rust type maps to and from a [`Value`].
 //! - [`Format`]: how a [`Value`] maps to and from bytes. [`json`], [`yaml`] and [`binary`] are
 //!   the formats included; any type that implements the traits works with all of them.
+//!
+//! Every format's syntax comes from a token set ([`json::JsonTokens`], [`yaml::YamlTokens`],
+//! [`binary::BinaryTokens`]) that can be changed one token at a time. Each set is checked
+//! before use, so no two tokens can be confused with each other.
 //!
 //! ```
 //! use black_serde::{Deserialize, Error, Fields, MapBuilder, Serialize, Value};
@@ -28,26 +32,31 @@
 //! }
 //!
 //! let p = Point { x: 3, y: -4, label: None };
-//! let text = black_serde::json::to_string(&p);
+//! let text = black_serde::json::to_string(&p).unwrap();
 //! assert_eq!(text, r#"{"x":3,"y":-4,"label":null}"#);
 //! assert_eq!(black_serde::json::from_str::<Point>(&text).unwrap(), p);
 //!
-//! let bytes = black_serde::binary::to_vec(&p);
+//! let bytes = black_serde::binary::to_vec(&p).unwrap();
 //! assert_eq!(black_serde::binary::from_slice::<Point>(&bytes).unwrap(), p);
 //! ```
 
 mod error;
+mod limits;
+mod tokens;
 mod value;
 
 pub mod binary;
 pub mod json;
 pub mod yaml;
 
-pub use error::{Error, Position, Segment};
+pub use error::{Error, ErrorKind, Limit, Position, Segment};
+pub use limits::Limits;
 pub use value::Value;
 
+pub(crate) use value::{KeyIndex, hash_value, same, walk};
+
 use std::collections::{BTreeMap, HashMap};
-use std::hash::BuildHasher;
+use std::hash::{BuildHasher, Hash};
 
 /// A type that can be turned into a [`Value`].
 pub trait Serialize {
@@ -60,13 +69,17 @@ pub trait Deserialize: Sized {
 }
 
 /// A way of writing a [`Value`] as bytes and reading it back.
+///
+/// Encoding fails rather than silently changing the data: when a value can't be represented
+/// ([`ErrorKind::Unrepresentable`], unless the format's lossy options allow it) or is nested
+/// deeper than the format's `max_depth` ([`Limit::Depth`]). The error's path says where.
 pub trait Format {
-    fn encode(&self, value: &Value) -> Vec<u8>;
+    fn encode(&self, value: &Value) -> Result<Vec<u8>, Error>;
     fn decode(&self, input: &[u8]) -> Result<Value, Error>;
 }
 
 /// Serialize `value` with any format.
-pub fn to_bytes<F: Format, T: Serialize + ?Sized>(format: &F, value: &T) -> Vec<u8> {
+pub fn to_bytes<F: Format, T: Serialize + ?Sized>(format: &F, value: &T) -> Result<Vec<u8>, Error> {
     format.encode(&value.serialize())
 }
 
@@ -79,7 +92,7 @@ pub fn from_bytes<F: Format, T: Deserialize>(format: &F, input: &[u8]) -> Result
 
 /// Builds a map [`Value`] field by field, for `Serialize` impls.
 #[derive(Default)]
-pub struct MapBuilder(Vec<(String, Value)>);
+pub struct MapBuilder(Vec<(Value, Value)>);
 
 impl MapBuilder {
     pub fn new() -> Self {
@@ -87,7 +100,7 @@ impl MapBuilder {
     }
 
     pub fn field<T: Serialize + ?Sized>(mut self, name: &str, value: &T) -> Self {
-        self.0.push((name.to_string(), value.serialize()));
+        self.0.push((Value::from(name), value.serialize()));
         self
     }
 
@@ -100,7 +113,7 @@ impl MapBuilder {
     }
 
     pub fn value(mut self, name: &str, value: Value) -> Self {
-        self.0.push((name.to_string(), value));
+        self.0.push((Value::from(name), value));
         self
     }
 
@@ -114,8 +127,8 @@ pub struct Fields<'a>(&'a Value);
 
 impl<'a> Fields<'a> {
     pub fn new(value: &'a Value) -> Result<Self, Error> {
-        match value {
-            Value::Map(_) => Ok(Fields(value)),
+        match value.untagged() {
+            v @ Value::Map(_) => Ok(Fields(v)),
             other => Err(Error::expected("a map", other)),
         }
     }
@@ -134,7 +147,8 @@ impl<'a> Fields<'a> {
     /// An optional field: missing or null gives `None`.
     pub fn opt<T: Deserialize>(&self, name: &str) -> Result<Option<T>, Error> {
         match self.raw(name) {
-            None | Some(Value::Null) => Ok(None),
+            None => Ok(None),
+            Some(v) if v.is_null() => Ok(None),
             Some(v) => T::deserialize(v).map(Some).map_err(|e| e.in_key(name)),
         }
     }
@@ -179,7 +193,7 @@ macro_rules! ints {
         impl Deserialize for $t {
             fn deserialize(v: &Value) -> Result<Self, Error> {
                 let out_of_range = || Error::new(format!("integer out of range for {}", stringify!($t)));
-                match v {
+                match v.untagged() {
                     Value::Int(_) | Value::UInt(_) | Value::Float(_) => {}
                     other => return Err(Error::expected("an integer", other)),
                 }
@@ -189,7 +203,7 @@ macro_rules! ints {
                 if let Some(u) = v.as_u64() {
                     return <$t>::try_from(u).map_err(|_| out_of_range());
                 }
-                match v {
+                match v.untagged() {
                     Value::Float(f) if f.fract() != 0.0 => Err(Error::new(format!("expected an integer, found {f}"))),
                     _ => Err(out_of_range()),
                 }
@@ -320,7 +334,7 @@ impl<T: Serialize> Serialize for Vec<T> {
 
 impl<T: Deserialize> Deserialize for Vec<T> {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        match v {
+        match v.untagged() {
             Value::Seq(items) => {
                 items.iter().enumerate().map(|(i, item)| T::deserialize(item).map_err(|e| e.in_index(i))).collect()
             }
@@ -335,8 +349,8 @@ impl<T: Deserialize> Deserialize for Vec<T> {
     }
 }
 
-/// A byte buffer that serializes as [`Value::Bytes`] (compact in binary formats) instead of
-/// as a sequence of integers.
+/// A byte buffer that serializes as [`Value::Bytes`] (compact in binary, `!!binary` in YAML)
+/// instead of as a sequence of integers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Bytes(pub Vec<u8>);
 
@@ -348,39 +362,95 @@ impl Serialize for Bytes {
 
 impl Deserialize for Bytes {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        match v {
+        match v.untagged() {
             Value::Bytes(b) => Ok(Bytes(b.clone())),
             _ => Vec::<u8>::deserialize(v).map(Bytes),
         }
     }
 }
 
-impl<V: Serialize> Serialize for BTreeMap<String, V> {
-    fn serialize(&self) -> Value {
-        Value::Map(self.iter().map(|(k, v)| (k.clone(), v.serialize())).collect())
+/// Read a map key. Formats differ in what keys can be (JSON keys are always strings, YAML keys
+/// are typed), so a key that doesn't fit `K` is retried as text, or text as a scalar:
+/// `{"1": x}` reads into `HashMap<u32, _>`, and YAML `{1: x}` into `HashMap<String, _>`.
+fn map_key<K: Deserialize>(key: &Value) -> Result<K, Error> {
+    match K::deserialize(key) {
+        Ok(k) => Ok(k),
+        Err(e) => {
+            let retry = match key.untagged() {
+                Value::String(s) => match yaml::resolve_plain(s) {
+                    Value::String(_) => return Err(e),
+                    scalar => scalar,
+                },
+                Value::Seq(_) | Value::Map(_) | Value::Bytes(_) => return Err(e),
+                scalar => Value::String(scalar.key_text()),
+            };
+            K::deserialize(&retry).map_err(|_| e)
+        }
     }
 }
 
-impl<V: Deserialize> Deserialize for BTreeMap<String, V> {
+fn map_entries<K: Deserialize, V: Deserialize>(v: &Value) -> impl Iterator<Item = Result<(K, V), Error>> + '_ {
+    let pairs = v.as_map().map(|p| p.as_slice()).unwrap_or(&[]);
+    pairs.iter().map(|(k, item)| {
+        let path = k.key_text();
+        let key = map_key(k).map_err(|e| e.in_key(&path))?;
+        Ok((key, V::deserialize(item).map_err(|e| e.in_key(&path))?))
+    })
+}
+
+impl<K: Serialize, V: Serialize> Serialize for BTreeMap<K, V> {
+    fn serialize(&self) -> Value {
+        Value::Map(self.iter().map(|(k, v)| (k.serialize(), v.serialize())).collect())
+    }
+}
+
+impl<K: Deserialize + Ord, V: Deserialize> Deserialize for BTreeMap<K, V> {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        let pairs = v.as_map().ok_or_else(|| Error::expected("a map", v))?;
-        pairs.iter().map(|(k, item)| Ok((k.clone(), V::deserialize(item).map_err(|e| e.in_key(k))?))).collect()
+        if v.as_map().is_none() {
+            return Err(Error::expected("a map", v));
+        }
+        map_entries(v).collect()
     }
 }
 
 /// Keys are written in sorted order so the output is the same on every run.
-impl<V: Serialize, S> Serialize for HashMap<String, V, S> {
+impl<K: Serialize + Ord, V: Serialize, S> Serialize for HashMap<K, V, S> {
     fn serialize(&self) -> Value {
-        let mut pairs: Vec<_> = self.iter().map(|(k, v)| (k.clone(), v.serialize())).collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        Value::Map(pairs)
+        let mut pairs: Vec<_> = self.iter().collect();
+        pairs.sort_by(|a, b| a.0.cmp(b.0));
+        Value::Map(pairs.into_iter().map(|(k, v)| (k.serialize(), v.serialize())).collect())
     }
 }
 
-impl<V: Deserialize, S: BuildHasher + Default> Deserialize for HashMap<String, V, S> {
+impl<K: Deserialize + Eq + Hash, V: Deserialize, S: BuildHasher + Default> Deserialize for HashMap<K, V, S> {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        let pairs = v.as_map().ok_or_else(|| Error::expected("a map", v))?;
-        pairs.iter().map(|(k, item)| Ok((k.clone(), V::deserialize(item).map_err(|e| e.in_key(k))?))).collect()
+        if v.as_map().is_none() {
+            return Err(Error::expected("a map", v));
+        }
+        map_entries(v).collect()
+    }
+}
+
+/// A value with a tag. YAML writes it as `!tag value` and binary keeps the tag; JSON writes only
+/// the value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tagged<T> {
+    pub tag: String,
+    pub value: T,
+}
+
+impl<T: Serialize> Serialize for Tagged<T> {
+    fn serialize(&self) -> Value {
+        Value::tagged(self.tag.clone(), self.value.serialize())
+    }
+}
+
+impl<T: Deserialize> Deserialize for Tagged<T> {
+    fn deserialize(v: &Value) -> Result<Self, Error> {
+        match v {
+            Value::Tagged(tag, inner) => Ok(Tagged { tag: tag.clone(), value: T::deserialize(inner)? }),
+            other => Err(Error::expected("a tagged value", other)),
+        }
     }
 }
 
@@ -472,10 +542,10 @@ mod tests {
     #[test]
     fn same_type_through_every_format() {
         let s = sample();
-        assert_eq!(json::from_str::<Outer>(&json::to_string(&s)).unwrap(), s);
-        assert_eq!(binary::from_slice::<Outer>(&binary::to_vec(&s)).unwrap(), s);
-        assert_eq!(yaml::from_str::<Outer>(&yaml::to_string(&s)).unwrap(), s);
-        assert_eq!(from_bytes::<_, Outer>(&json::Json::pretty(2), &to_bytes(&json::Json::pretty(2), &s)).unwrap(), s);
+        assert_eq!(json::from_str::<Outer>(&json::to_string(&s).unwrap()).unwrap(), s);
+        assert_eq!(binary::from_slice::<Outer>(&binary::to_vec(&s).unwrap()).unwrap(), s);
+        assert_eq!(yaml::from_str::<Outer>(&yaml::to_string(&s).unwrap()).unwrap(), s);
+        assert_eq!(from_bytes::<_, Outer>(&json::Json::pretty(2), &to_bytes(&json::Json::pretty(2), &s).unwrap()).unwrap(), s);
     }
 
     #[test]
@@ -493,7 +563,7 @@ mod tests {
         let s = sample();
         assert!(s.serialize().get("note").is_none());
         let with = Outer { note: Some("hi".into()), ..sample() };
-        assert_eq!(json::from_str::<Outer>(&json::to_string(&with)).unwrap(), with);
+        assert_eq!(json::from_str::<Outer>(&json::to_string(&with).unwrap()).unwrap(), with);
         // An explicit null is the same as missing.
         let v = json::from_str::<Outer>(r#"{"name":"x","scale":1,"items":[],"note":null}"#).unwrap();
         assert_eq!(v.note, None);
@@ -516,18 +586,21 @@ mod tests {
         let mut hm = HashMap::new();
         hm.insert("b".to_string(), 2);
         hm.insert("a".to_string(), 1);
-        assert_eq!(json::to_string(&hm), r#"{"a":1,"b":2}"#);
+        assert_eq!(json::to_string(&hm).unwrap(), r#"{"a":1,"b":2}"#);
         assert_eq!(json::from_str::<HashMap<String, i32>>(r#"{"a":1,"b":2}"#).unwrap(), hm);
 
         let t = (1u8, "two".to_string(), Some(3.5), 'x');
-        assert_eq!(json::from_str::<(u8, String, Option<f64>, char)>(&json::to_string(&t)).unwrap(), t);
+        assert_eq!(json::from_str::<(u8, String, Option<f64>, char)>(&json::to_string(&t).unwrap()).unwrap(), t);
         assert!(json::from_str::<(u8, u8)>("[1]").is_err());
 
         let bytes = Bytes(vec![0, 1, 255]);
-        assert_eq!(binary::from_slice::<Bytes>(&binary::to_vec(&bytes)).unwrap(), bytes);
-        assert_eq!(json::to_string(&bytes), "[0,1,255]");
+        assert_eq!(binary::from_slice::<Bytes>(&binary::to_vec(&bytes).unwrap()).unwrap(), bytes);
+        // JSON has no bytes, so writing them is an error unless numbers are allowed instead.
+        assert_eq!(json::to_string(&bytes).unwrap_err().kind(), ErrorKind::Unrepresentable);
+        let lossy = json::Json::compact().lossy(json::JsonLossy { bytes: true, ..json::JsonLossy::NONE });
+        assert_eq!(lossy.write(&bytes.serialize()).unwrap(), "[0,1,255]");
         assert_eq!(json::from_str::<Bytes>("[0,1,255]").unwrap(), bytes);
-        assert_eq!(binary::from_slice::<Vec<u8>>(&binary::to_vec(&bytes)).unwrap(), bytes.0);
+        assert_eq!(binary::from_slice::<Vec<u8>>(&binary::to_vec(&bytes).unwrap()).unwrap(), bytes.0);
         assert!(char::deserialize(&Value::from("ab")).is_err());
     }
 }
