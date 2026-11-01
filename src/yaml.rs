@@ -51,12 +51,11 @@ use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
 use crate::tokens::{check_prefix_free, check_start, check_text};
-use crate::{Deserialize, Error, Format, KeyIndex, Limit, Limits, Serialize, Value, hash_value, same, walk};
+use crate::{Deserialize, Error, Format, KeyIndex, Limit, Limits, Serialize, Value, count_values, hash_value, same, walk};
 
-/// Nesting deeper than this is rejected, so hostile input can't overflow the stack. It's lower
-/// than JSON's because YAML's parser takes more stack per level: this leaves room to spare on
-/// a 1 MB stack (a Windows main thread) even in a debug build.
-pub const MAX_DEPTH: usize = 100;
+/// The default limit on nesting; see [`Limits`]. Reading and writing don't recurse, so this
+/// is a policy, not a protection for the stack.
+pub const MAX_DEPTH: usize = 256;
 /// The prefix of the standard tags, which `!!` abbreviates.
 pub const CORE_TAG_PREFIX: &str = "tag:yaml.org,2002:";
 
@@ -546,45 +545,66 @@ enum Shape {
     Literal,
 }
 
-/// Measure every node: a hash consistent with `same`, and its size (values in it, including
-/// itself, not counting keys).
-fn measure(v: &Value, info: &mut HashMap<*const Value, (u64, usize)>) -> (u64, usize) {
-    let mut h = DefaultHasher::new();
-    std::mem::discriminant(v).hash(&mut h);
-    let size = match v {
-        Value::Seq(items) => {
-            let mut n = 1;
-            for item in items {
-                let (ih, is) = measure(item, info);
-                ih.hash(&mut h);
-                n += is;
+fn ptr(v: &Value) -> *const Value {
+    v as *const Value
+}
+
+/// Measure every node, without recursing: a hash consistent with `same`, and its size (values
+/// in it, including itself, not counting keys).
+fn measure(root: &Value) -> HashMap<*const Value, (u64, usize)> {
+    let mut info: HashMap<*const Value, (u64, usize)> = HashMap::new();
+    // Post-order: a container is measured once its children have been.
+    let mut stack: Vec<(&Value, bool)> = vec![(root, false)];
+    while let Some((v, children_done)) = stack.pop() {
+        if !children_done {
+            let start = stack.len();
+            match v {
+                Value::Seq(items) => stack.extend(items.iter().map(|i| (i, false))),
+                Value::Map(pairs) => stack.extend(pairs.iter().map(|(_, i)| (i, false))),
+                Value::Tagged(_, inner) => stack.push((inner, false)),
+                _ => {}
             }
-            n
-        }
-        Value::Map(pairs) => {
-            let mut n = 1;
-            for (k, item) in pairs {
-                hash_value(k, &mut h);
-                let (ih, is) = measure(item, info);
-                ih.hash(&mut h);
-                n += is;
+            if stack.len() > start || matches!(v, Value::Seq(_) | Value::Map(_)) {
+                stack.insert(start, (v, true));
+                continue;
             }
-            n
         }
-        Value::Tagged(tag, inner) => {
-            tag.hash(&mut h);
-            let (ih, is) = measure(inner, info);
-            ih.hash(&mut h);
-            is
-        }
-        scalar => {
-            hash_value(scalar, &mut h);
-            1
-        }
-    };
-    let out = (h.finish(), size);
-    info.insert(v as *const Value, out);
-    out
+        let mut h = DefaultHasher::new();
+        std::mem::discriminant(v).hash(&mut h);
+        let size = match v {
+            Value::Seq(items) => {
+                let mut n = 1;
+                for item in items {
+                    let (ih, is) = info[&ptr(item)];
+                    ih.hash(&mut h);
+                    n += is;
+                }
+                n
+            }
+            Value::Map(pairs) => {
+                let mut n = 1;
+                for (k, item) in pairs {
+                    hash_value(k, &mut h);
+                    let (ih, is) = info[&ptr(item)];
+                    ih.hash(&mut h);
+                    n += is;
+                }
+                n
+            }
+            Value::Tagged(tag, inner) => {
+                tag.hash(&mut h);
+                let (ih, is) = info[&ptr(inner)];
+                ih.hash(&mut h);
+                is
+            }
+            scalar => {
+                hash_value(scalar, &mut h);
+                1
+            }
+        };
+        info.insert(ptr(v), (h.finish(), size));
+    }
+    info
 }
 
 /// Decides which subtrees get anchors and which are written as aliases, walking in the order
@@ -593,47 +613,43 @@ fn measure(v: &Value, info: &mut HashMap<*const Value, (u64, usize)>) -> (u64, u
 struct Planner<'a> {
     info: HashMap<*const Value, (u64, usize)>,
     min: usize,
-    seen: HashMap<u64, Vec<(&'a Value, String)>>,
+    seen: HashMap<u64, Vec<(&'a Value, &'a str)>>,
     names: HashSet<String>,
     anchors: HashMap<*const Value, String>,
     aliases: HashMap<*const Value, *const Value>,
 }
 
 impl<'a> Planner<'a> {
-    fn visit(&mut self, v: &'a Value, hint: &str) {
-        let (hash, size) = self.info[&(v as *const Value)];
-        let content = v.untagged();
-        let container = match content {
-            Value::Seq(s) => !s.is_empty(),
-            Value::Map(m) => !m.is_empty(),
-            _ => false,
-        };
-        if size < self.min || !container {
-            return;
-        }
-        let found = self.seen.get(&hash).and_then(|b| b.iter().find(|(f, _)| same(f, v))).map(|(f, h)| (*f as *const Value, h.clone()));
-        if let Some((first, first_hint)) = found {
-            if !self.anchors.contains_key(&first) {
-                let name = self.unique_name(&first_hint);
-                self.anchors.insert(first, name);
+    /// Walk `root` in writing order, without recursing; each value comes with a hint for its
+    /// anchor's name (the key it's under).
+    fn plan(&mut self, root: &'a Value) {
+        let mut stack: Vec<(&'a Value, &'a str)> = vec![(root, "root")];
+        while let Some((v, hint)) = stack.pop() {
+            let (hash, size) = self.info[&ptr(v)];
+            let content = v.untagged();
+            let container = match content {
+                Value::Seq(s) => !s.is_empty(),
+                Value::Map(m) => !m.is_empty(),
+                _ => false,
+            };
+            if size < self.min || !container {
+                continue;
             }
-            self.aliases.insert(v as *const Value, first);
-            return;
-        }
-        self.seen.entry(hash).or_default().push((v, hint.to_string()));
-        match content {
-            Value::Seq(items) => {
-                for item in items {
-                    self.visit(item, "item");
+            let found = self.seen.get(&hash).and_then(|b| b.iter().find(|(f, _)| same(f, v))).map(|&(f, h)| (ptr(f), h));
+            if let Some((first, first_hint)) = found {
+                if !self.anchors.contains_key(&first) {
+                    let name = self.unique_name(first_hint);
+                    self.anchors.insert(first, name);
                 }
+                self.aliases.insert(ptr(v), first);
+                continue;
             }
-            Value::Map(pairs) => {
-                for (k, item) in pairs {
-                    let hint = k.as_str().unwrap_or("value");
-                    self.visit(item, hint);
-                }
+            self.seen.entry(hash).or_default().push((v, hint));
+            match content {
+                Value::Seq(items) => stack.extend(items.iter().rev().map(|i| (i, "item"))),
+                Value::Map(pairs) => stack.extend(pairs.iter().rev().map(|(k, i)| (i, k.as_str().unwrap_or("value")))),
+                _ => {}
             }
-            _ => {}
         }
     }
 
@@ -654,6 +670,23 @@ impl<'a> Planner<'a> {
     }
 }
 
+/// A piece of output still to be written. The writer keeps these on a heap stack instead of
+/// recursing; output is only ever appended, so running them in order gives the same text a
+/// recursive writer would.
+enum Task<'a> {
+    Text(&'static str),
+    Newline(usize),
+    /// A value in flow style.
+    Flow(&'a Value),
+    /// The body of a non-empty block collection whose first line starts at column `col` (the
+    /// indentation and properties are already written).
+    Block { c: &'a Value, col: usize, depth: usize },
+    /// A block sequence item, after its `- `, with its content at column `child`.
+    Item { item: &'a Value, child: usize, depth: usize },
+    /// A block mapping entry at column `col`.
+    Entry { k: &'a Value, item: &'a Value, col: usize, depth: usize },
+}
+
 struct Writer<'a> {
     o: &'a Yaml,
     out: String,
@@ -665,17 +698,15 @@ impl<'a> Writer<'a> {
     fn new(o: &'a Yaml, root: &'a Value) -> Self {
         let (anchors, aliases) = match o.anchor_min_size {
             Some(min) => {
-                let mut info = HashMap::new();
-                measure(root, &mut info);
                 let mut p = Planner {
-                    info,
+                    info: measure(root),
                     min,
                     seen: HashMap::new(),
                     names: HashSet::new(),
                     anchors: HashMap::new(),
                     aliases: HashMap::new(),
                 };
-                p.visit(root, "root");
+                p.plan(root);
                 (p.anchors, p.aliases)
             }
             None => (HashMap::new(), HashMap::new()),
@@ -688,11 +719,11 @@ impl<'a> Writer<'a> {
     }
 
     fn alias_name(&self, v: &Value) -> Option<&str> {
-        let first = self.aliases.get(&(v as *const Value))?;
+        let first = self.aliases.get(&ptr(v))?;
         self.anchors.get(first).map(String::as_str)
     }
 
-    fn document(&mut self, v: &Value, marker: bool) {
+    fn document(&mut self, v: &'a Value, marker: bool) {
         match self.shape(v, 0, false) {
             Shape::Block => {
                 let props = self.props(v);
@@ -704,16 +735,41 @@ impl<'a> Writer<'a> {
                     }
                     self.out.push('\n');
                 }
-                self.block(v.untagged(), 0, 0);
+                self.run(Task::Block { c: v.untagged(), col: 0, depth: 0 });
             }
             _ => {
                 if marker {
                     self.out.push_str(self.o.tokens.doc_start);
                     self.out.push(' ');
                 }
-                self.flow(v);
+                self.run(Task::Flow(v));
             }
         }
+    }
+
+    /// Run `first` and every task it adds.
+    fn run(&mut self, first: Task<'a>) {
+        let mut tasks = vec![first];
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Text(s) => self.out.push_str(s),
+                Task::Newline(col) => self.newline(col),
+                Task::Flow(v) => self.flow(v, &mut tasks),
+                Task::Block { c, col, depth } => self.block(c, col, depth, &mut tasks),
+                Task::Item { item, child, depth } => self.item(item, child, depth, &mut tasks),
+                Task::Entry { k, item, col, depth } => {
+                    self.block_key(k, col);
+                    self.block_value(item, col + self.o.indent, depth + 1, &mut tasks);
+                }
+            }
+        }
+    }
+
+    /// A value written in flow style on its own, such as a key.
+    fn flow_text(&mut self, v: &'a Value) -> String {
+        let saved = std::mem::take(&mut self.out);
+        self.run(Task::Flow(v));
+        std::mem::replace(&mut self.out, saved)
     }
 
     fn shape(&self, v: &Value, depth: usize, literal_ok: bool) -> Shape {
@@ -732,7 +788,7 @@ impl<'a> Writer<'a> {
     fn props(&self, v: &Value) -> String {
         let t = self.t();
         let mut p = String::new();
-        if let Some(name) = self.anchors.get(&(v as *const Value)) {
+        if let Some(name) = self.anchors.get(&ptr(v)) {
             p.push_str(t.anchor);
             p.push_str(name);
         }
@@ -776,71 +832,71 @@ impl<'a> Writer<'a> {
         self.out.extend(std::iter::repeat_n(' ', col));
     }
 
-    /// The body of a non-empty block collection whose first line starts at column `col`
-    /// (the caller has written any indentation and properties).
-    fn block(&mut self, c: &Value, col: usize, depth: usize) {
+    /// Queue the entries or items of a non-empty block collection.
+    fn block(&mut self, c: &'a Value, col: usize, depth: usize, tasks: &mut Vec<Task<'a>>) {
         let t = *self.t();
         match c {
             Value::Map(pairs) => {
-                for (i, (k, item)) in pairs.iter().enumerate() {
+                for (i, (k, item)) in pairs.iter().enumerate().rev() {
+                    tasks.push(Task::Entry { k, item, col, depth });
                     if i > 0 {
-                        self.newline(col);
+                        tasks.push(Task::Newline(col));
                     }
-                    self.block_key(k, col);
-                    self.block_value(item, col + self.o.indent, depth + 1);
                 }
             }
             Value::Seq(items) => {
                 let child = col + t.seq_entry.chars().count() + 1;
-                for (i, item) in items.iter().enumerate() {
+                for (i, item) in items.iter().enumerate().rev() {
+                    tasks.push(Task::Item { item, child, depth: depth + 1 });
+                    tasks.push(Task::Text(" "));
+                    tasks.push(Task::Text(t.seq_entry));
                     if i > 0 {
-                        self.newline(col);
-                    }
-                    self.out.push_str(t.seq_entry);
-                    self.out.push(' ');
-                    match self.shape(item, depth + 1, true) {
-                        Shape::Inline => self.flow(item),
-                        Shape::Block => {
-                            let props = self.props(item);
-                            if !props.is_empty() {
-                                self.out.push_str(&props);
-                                self.newline(child);
-                            }
-                            self.block(item.untagged(), child, depth + 1);
-                        }
-                        Shape::Literal => self.literal(item, child),
+                        tasks.push(Task::Newline(col));
                     }
                 }
             }
-            other => self.flow(other),
+            other => tasks.push(Task::Flow(other)),
+        }
+    }
+
+    /// A block sequence item, after its `- `.
+    fn item(&mut self, item: &'a Value, child: usize, depth: usize, tasks: &mut Vec<Task<'a>>) {
+        match self.shape(item, depth, true) {
+            Shape::Inline => tasks.push(Task::Flow(item)),
+            Shape::Block => {
+                let props = self.props(item);
+                if !props.is_empty() {
+                    self.out.push_str(&props);
+                    self.newline(child);
+                }
+                tasks.push(Task::Block { c: item.untagged(), col: child, depth });
+            }
+            Shape::Literal => self.literal(item, child),
         }
     }
 
     /// A key, followed by the value indicator.
-    fn block_key(&mut self, k: &Value, col: usize) {
+    fn block_key(&mut self, k: &'a Value, col: usize) {
         let t = *self.t();
-        if implicit_key(k) {
-            let start = self.out.len();
-            self.flow(k);
-            if self.out.len() - start <= 1024 {
-                self.out.push_str(t.value);
-                return;
-            }
-            self.out.truncate(start);
+        let text = self.flow_text(k);
+        if implicit_key(k) && text.len() <= 1024 {
+            self.out.push_str(&text);
+            self.out.push_str(t.value);
+            return;
         }
         self.out.push_str(t.key);
         self.out.push(' ');
-        self.flow(k);
+        self.out.push_str(&text);
         self.newline(col);
         self.out.push_str(t.value);
     }
 
     /// A mapping value, after its key's value indicator.
-    fn block_value(&mut self, item: &Value, child: usize, depth: usize) {
+    fn block_value(&mut self, item: &'a Value, child: usize, depth: usize, tasks: &mut Vec<Task<'a>>) {
         match self.shape(item, depth, true) {
             Shape::Inline => {
                 self.out.push(' ');
-                self.flow(item);
+                tasks.push(Task::Flow(item));
             }
             Shape::Block => {
                 let props = self.props(item);
@@ -849,7 +905,7 @@ impl<'a> Writer<'a> {
                     self.out.push_str(&props);
                 }
                 self.newline(child);
-                self.block(item.untagged(), child, depth);
+                tasks.push(Task::Block { c: item.untagged(), col: child, depth });
             }
             Shape::Literal => {
                 self.out.push(' ');
@@ -886,7 +942,8 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn flow(&mut self, v: &Value) {
+    /// Write a value in flow style: scalars at once, collections as queued tasks.
+    fn flow(&mut self, v: &'a Value, tasks: &mut Vec<Task<'a>>) {
         let t = *self.t();
         if let Some(name) = self.alias_name(v) {
             let name = name.to_string();
@@ -924,35 +981,37 @@ impl<'a> Writer<'a> {
             }
             Value::Seq(items) => {
                 self.out.push_str(t.flow_seq_open);
-                for (i, item) in items.iter().enumerate() {
+                tasks.push(Task::Text(t.flow_seq_close));
+                for (i, item) in items.iter().enumerate().rev() {
+                    tasks.push(Task::Flow(item));
                     if i > 0 {
-                        self.out.push_str(t.flow_entry);
-                        self.out.push(' ');
+                        tasks.push(Task::Text(" "));
+                        tasks.push(Task::Text(t.flow_entry));
                     }
-                    self.flow(item);
                 }
-                self.out.push_str(t.flow_seq_close);
             }
             Value::Map(pairs) => {
                 self.out.push_str(t.flow_map_open);
-                for (i, (k, item)) in pairs.iter().enumerate() {
-                    if i > 0 {
-                        self.out.push_str(t.flow_entry);
-                        self.out.push(' ');
-                    }
+                tasks.push(Task::Text(t.flow_map_close));
+                // Each entry, pushed in reverse: [", "] key ": " value, or with an explicit
+                // key, [", "] "? " key " : " value.
+                for (i, (k, item)) in pairs.iter().enumerate().rev() {
+                    tasks.push(Task::Flow(item));
+                    tasks.push(Task::Text(" "));
+                    tasks.push(Task::Text(t.value));
                     if implicit_key(k) {
-                        self.flow(k);
+                        tasks.push(Task::Flow(k));
                     } else {
-                        self.out.push_str(t.key);
-                        self.out.push(' ');
-                        self.flow(k);
-                        self.out.push(' ');
+                        tasks.push(Task::Text(" "));
+                        tasks.push(Task::Flow(k));
+                        tasks.push(Task::Text(" "));
+                        tasks.push(Task::Text(t.key));
                     }
-                    self.out.push_str(t.value);
-                    self.out.push(' ');
-                    self.flow(item);
+                    if i > 0 {
+                        tasks.push(Task::Text(" "));
+                        tasks.push(Task::Text(t.flow_entry));
+                    }
                 }
-                self.out.push_str(t.flow_map_close);
             }
             Value::Tagged(..) => unreachable!("untagged"),
         }
@@ -1234,6 +1293,10 @@ struct Scanner {
     tab_mark: Option<Mark>,
     /// For each open flow collection, whether it's a mapping.
     flow_maps: Vec<bool>,
+    /// Pending simple keys as (flow level, index), in the order they were saved.
+    key_order: VecDeque<(usize, usize)>,
+    /// The line the one-line rule for keys was last checked on.
+    checked_line: usize,
 }
 
 impl Scanner {
@@ -1278,6 +1341,8 @@ impl Scanner {
             plain_multiline: false,
             tab_mark: None,
             flow_maps: Vec::new(),
+            key_order: VecDeque::new(),
+            checked_line: 0,
         })
     }
 
@@ -1305,7 +1370,7 @@ impl Scanner {
             }
             if !self.tokens.is_empty() {
                 self.stale_simple_keys()?;
-                let next_key = self.simple_keys.iter().flatten().map(|k| k.token_number).min();
+                let next_key = self.oldest_key().map(|(_, k)| k.token_number);
                 if next_key != Some(self.tokens_taken) {
                     return Ok(());
                 }
@@ -1414,8 +1479,10 @@ impl Scanner {
         s
     }
 
+    /// Only blanks come before this point on the line. Checked from here backwards, so it
+    /// stops at the first character on a long line rather than scanning it all.
     fn in_indentation(&self) -> bool {
-        self.chars[self.pos - self.col..self.pos].iter().all(|&c| is_blank(c))
+        self.chars[self.pos - self.col..self.pos].iter().rev().all(|&c| is_blank(c))
     }
 
     // --- dispatch ---
@@ -1585,21 +1652,57 @@ impl Scanner {
 
     // --- simple keys and indentation ---
 
-    fn stale_simple_keys(&mut self) -> Result<(), Error> {
-        // A key in a block mapping or a flow sequence (`[a: 1]`) must be on one line; inside a
-        // flow mapping it may span lines (`{"a"\n: 1}`). Either way it's at most 1024
-        // characters.
-        for i in 0..self.simple_keys.len() {
-            let one_line = i == 0 || !self.flow_maps.get(i - 1).copied().unwrap_or(false);
-            if let Some(k) = self.simple_keys[i]
-                && ((one_line && k.mark.line != self.line) || self.pos > k.index + 1024)
+    /// The oldest pending simple key, with its flow level. Queue entries for keys that have
+    /// since been used or removed are dropped along the way.
+    fn oldest_key(&mut self) -> Option<(usize, SimpleKey)> {
+        while let Some(&(level, index)) = self.key_order.front() {
+            if let Some(Some(k)) = self.simple_keys.get(level)
+                && k.index == index
             {
-                if k.required {
-                    return Err(error_at(k.mark, "expected ':' after this mapping key (each entry needs 'key: value')"));
+                return Some((level, *k));
+            }
+            self.key_order.pop_front();
+        }
+        None
+    }
+
+    /// Drop pending keys that can no longer get their ':'. A key in a block mapping or a flow
+    /// sequence (`[a: 1]`) must be on one line; inside a flow mapping it may span lines
+    /// (`{"a"\n: 1}`). Either way it's at most 1024 characters.
+    ///
+    /// This runs for every token, so it never looks at every nesting level: keys are queued
+    /// in the order they were saved, so the ones too far back are at the front, and the line
+    /// rule only needs checking when the line changes.
+    fn stale_simple_keys(&mut self) -> Result<(), Error> {
+        while let Some((level, k)) = self.oldest_key() {
+            if self.pos <= k.index + 1024 {
+                break;
+            }
+            self.stale(level, k)?;
+        }
+        if self.line != self.checked_line {
+            self.checked_line = self.line;
+            for (level, index) in std::mem::take(&mut self.key_order) {
+                let Some(Some(k)) = self.simple_keys.get(level).copied() else { continue };
+                if k.index != index {
+                    continue;
                 }
-                self.simple_keys[i] = None;
+                let one_line = level == 0 || !self.flow_maps.get(level - 1).copied().unwrap_or(false);
+                if one_line && k.mark.line != self.line {
+                    self.stale(level, k)?;
+                } else {
+                    self.key_order.push_back((level, index));
+                }
             }
         }
+        Ok(())
+    }
+
+    fn stale(&mut self, level: usize, k: SimpleKey) -> Result<(), Error> {
+        if k.required {
+            return Err(error_at(k.mark, "expected ':' after this mapping key (each entry needs 'key: value')"));
+        }
+        self.simple_keys[level] = None;
         Ok(())
     }
 
@@ -1610,6 +1713,7 @@ impl Scanner {
             let token_number = self.tokens_taken + self.tokens.len();
             self.simple_keys[self.flow_level] =
                 Some(SimpleKey { token_number, required, index: self.pos, mark: self.mark(), tab: self.tab_mark });
+            self.key_order.push_back((self.flow_level, self.pos));
         }
         Ok(())
     }
@@ -2388,15 +2492,6 @@ impl Scanner {
 
 // ---------- composing ----------
 
-fn count_nodes(v: &Value) -> usize {
-    match v {
-        Value::Seq(items) => 1 + items.iter().map(count_nodes).sum::<usize>(),
-        Value::Map(pairs) => 1 + pairs.iter().map(|(k, v)| count_nodes(k) + count_nodes(v)).sum::<usize>(),
-        Value::Tagged(_, inner) => count_nodes(inner),
-        _ => 1,
-    }
-}
-
 /// Collects a mapping's entries, rejecting duplicate keys and applying merge keys.
 #[derive(Default)]
 struct MapEntries {
@@ -2466,33 +2561,80 @@ impl MapEntries {
     }
 }
 
-/// One mapping entry: the key after its indicator (when `$k` is the key token), then the value.
-/// `$ends` are the tokens that end an entry in this kind of collection. It's a macro so that it
-/// expands inside each collection's function: a helper function would add a stack frame per
-/// nesting level.
-macro_rules! entry {
-    ($self:ident, $k:expr, $block:expr, $depth:expr, $ends:pat) => {{
-        let mut key = Value::Null;
-        let mut merge = false;
-        if $k == K::Key {
-            $self.skip()?;
-            // Block collections list `Value` among their ends too.
-            #[allow(unreachable_patterns)]
-            let no_key = matches!($self.peek()?.0, K::Value | $ends);
-            if !no_key {
-                key = $self.node($block, $block, $depth + 1)?;
-                merge = $self.is_merge(&key);
-            }
+/// What composing does next.
+enum Step {
+    /// Start a node (`block`: block collections may start here; `indentless`: so may a
+    /// sequence at the same indent as its key).
+    Node { block: bool, indentless: bool },
+    /// Continue the innermost open collection.
+    Next,
+    /// A node is finished.
+    Done(Value),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    BlockSeq { col: usize },
+    /// A block sequence at the same indent as its mapping key, which has no end token.
+    Indentless,
+    BlockMap { col: usize },
+    FlowSeq { first: bool },
+    FlowMap { first: bool },
+}
+
+impl Kind {
+    fn is_block(self) -> bool {
+        matches!(self, Kind::BlockSeq { .. } | Kind::Indentless | Kind::BlockMap { .. })
+    }
+
+    /// Tokens that end an entry's key or value early, leaving it null.
+    fn ends_entry(self, k: K) -> bool {
+        match self {
+            Kind::FlowSeq { .. } => matches!(k, K::FlowEntry | K::FlowSeqEnd),
+            Kind::FlowMap { .. } => matches!(k, K::FlowEntry | K::FlowMapEnd),
+            _ => matches!(k, K::Key | K::Value | K::BlockEnd),
         }
-        let mut value = Value::Null;
-        if $self.peek()?.0 == K::Value {
-            $self.skip()?;
-            if !matches!($self.peek()?.0, $ends) {
-                value = $self.node($block, $block, $depth + 1)?;
-            }
+    }
+}
+
+/// What an open collection is waiting for.
+enum Want {
+    /// A sequence item.
+    Item,
+    /// The key of an entry that started at the mark.
+    Key(Mark),
+    /// A key with no value indicator after it (flow mappings only).
+    BareKey(Mark),
+    /// The value for `key`.
+    Value { key: Value, merge: bool, m: Mark },
+}
+
+/// A collection being composed.
+struct Open {
+    kind: Kind,
+    items: Vec<Value>,
+    entries: MapEntries,
+    want: Want,
+    props: Props,
+    /// Where the collection starts, for errors about its tag.
+    at: Mark,
+}
+
+impl Open {
+    /// Add a finished entry: a pair in a mapping, or a single-pair mapping in a sequence.
+    fn add(&mut self, key: Value, value: Value, merge: bool, m: Mark) -> Result<(), Error> {
+        self.want = Want::Item;
+        if matches!(self.kind, Kind::FlowSeq { .. }) {
+            self.items.push(Value::Map(vec![(key, value)]));
+            Ok(())
+        } else {
+            self.entries.add(key, value, merge, m)
         }
-        (key, merge, value)
-    }};
+    }
+}
+
+fn top(stack: &mut [Open]) -> &mut Open {
+    stack.last_mut().expect("an open collection")
 }
 
 struct Composer {
@@ -2638,7 +2780,7 @@ impl Composer {
             self.peek()?.0,
             K::YamlDirective | K::TagDirective | K::OtherDirective | K::DocStart | K::DocEnd | K::StreamEnd
         );
-        let value = if empty { Value::Null } else { self.node(true, false, 0)? };
+        let value = if empty { Value::Null } else { self.compose(true, false)? };
         self.anchors.clear();
         self.expanded = 0;
         let (k, m) = self.peek()?;
@@ -2677,30 +2819,187 @@ impl Composer {
         Ok(format!("{prefix}{}", t.text))
     }
 
-    // The functions from here to the end of the impl call each other once per nesting level,
-    // so they're kept small: everything that isn't the recursion itself (properties, tags,
-    // anchors, error messages) lives in separate non-recursive functions, which keeps each
-    // level's stack frames small even in debug builds.
+    /// One node and everything inside it. Open collections are kept on a heap stack rather
+    /// than by recursing, so nesting is limited only by `max_depth`, never by the thread's
+    /// stack.
+    fn compose(&mut self, block: bool, indentless: bool) -> Result<Value, Error> {
+        let mut stack: Vec<Open> = Vec::new();
+        let mut step = Step::Node { block, indentless };
+        loop {
+            step = match step {
+                Step::Node { block, indentless } => self.start_node(&mut stack, block, indentless)?,
+                Step::Next => self.advance(&mut stack)?,
+                Step::Done(v) => match stack.last_mut() {
+                    None => return Ok(v),
+                    Some(open) => self.deliver(open, v)?,
+                },
+            };
+        }
+    }
 
-    fn node(&mut self, block: bool, indentless: bool, depth: usize) -> Result<Value, Error> {
+    /// Start a node: a scalar or alias is finished at once; a collection is opened.
+    fn start_node(&mut self, stack: &mut Vec<Open>, block: bool, indentless: bool) -> Result<Step, Error> {
         let (k, m) = self.peek()?;
-        if depth > self.limits.max_depth {
+        if stack.len() > self.limits.max_depth {
             return Err(self.fail(m, Fail::TooDeep));
         }
         if k == K::Alias {
-            return self.alias_node();
+            return Ok(Step::Done(self.alias_node()?));
         }
         let props = self.properties()?;
-        let (k, m) = self.peek()?;
-        let value = match k {
-            K::BlockEntry if indentless => self.indentless_seq(depth)?,
-            K::FlowSeqStart => self.flow_seq(depth)?,
-            K::FlowMapStart => self.flow_map(depth)?,
-            K::BlockSeqStart if block => self.block_seq(depth)?,
-            K::BlockMapStart if block => self.block_map(depth)?,
-            _ => return self.leaf(props, k, m),
+        let (k, at) = self.peek()?;
+        let kind = match k {
+            K::BlockEntry if indentless => Kind::Indentless,
+            K::FlowSeqStart => Kind::FlowSeq { first: true },
+            K::FlowMapStart => Kind::FlowMap { first: true },
+            K::BlockSeqStart if block => Kind::BlockSeq { col: at.col },
+            K::BlockMapStart if block => Kind::BlockMap { col: at.col },
+            _ => return Ok(Step::Done(self.leaf(props, k, at)?)),
         };
-        self.finish_node(props, value, m)
+        if kind != Kind::Indentless {
+            self.skip()?;
+        }
+        stack.push(Open { kind, items: Vec::new(), entries: MapEntries::default(), want: Want::Item, props, at });
+        Ok(Step::Next)
+    }
+
+    /// Look at the next token in the innermost open collection: start its next item, or
+    /// close it.
+    fn advance(&mut self, stack: &mut Vec<Open>) -> Result<Step, Error> {
+        let kind = stack.last().expect("an open collection").kind;
+        let (mut k, mut m) = self.peek()?;
+        match kind {
+            Kind::BlockSeq { col } => match k {
+                K::BlockEntry => {
+                    self.skip()?;
+                    if matches!(self.peek()?.0, K::BlockEntry | K::BlockEnd) {
+                        top(stack).items.push(Value::Null);
+                        return Ok(Step::Next);
+                    }
+                    Ok(Step::Node { block: true, indentless: false })
+                }
+                K::BlockEnd => {
+                    self.skip()?;
+                    self.close(stack)
+                }
+                found => Err(self.fail(m, Fail::Misplaced { col, seq: true, found })),
+            },
+            Kind::Indentless => {
+                if k != K::BlockEntry {
+                    return self.close(stack);
+                }
+                self.skip()?;
+                if matches!(self.peek()?.0, K::BlockEntry | K::Key | K::Value | K::BlockEnd) {
+                    top(stack).items.push(Value::Null);
+                    return Ok(Step::Next);
+                }
+                Ok(Step::Node { block: true, indentless: false })
+            }
+            Kind::BlockMap { col } => match k {
+                K::Key | K::Value => self.start_entry(top(stack), k, m),
+                K::BlockEnd => {
+                    self.skip()?;
+                    self.close(stack)
+                }
+                found => Err(self.fail(m, Fail::Misplaced { col, seq: false, found })),
+            },
+            Kind::FlowSeq { first } | Kind::FlowMap { first } => {
+                let seq = matches!(kind, Kind::FlowSeq { .. });
+                let end = if seq { K::FlowSeqEnd } else { K::FlowMapEnd };
+                let unterminated = |k: K| matches!(k, K::StreamEnd | K::DocStart | K::DocEnd);
+                if k == end {
+                    self.skip()?;
+                    return self.close(stack);
+                }
+                if unterminated(k) {
+                    return Err(self.fail(m, Fail::Unterminated { seq }));
+                }
+                if !first {
+                    if k != K::FlowEntry {
+                        return Err(self.fail(m, Fail::Separator { seq }));
+                    }
+                    self.skip()?;
+                    (k, m) = self.peek()?;
+                    // A trailing comma: the next step closes (or reports the missing end).
+                    if k == end || unterminated(k) {
+                        return Ok(Step::Next);
+                    }
+                }
+                top(stack).kind = if seq { Kind::FlowSeq { first: false } } else { Kind::FlowMap { first: false } };
+                match k {
+                    K::Key | K::Value => self.start_entry(top(stack), k, m),
+                    K::FlowEntry => Err(self.fail(m, Fail::EmptyEntry { seq })),
+                    _ => {
+                        // In a mapping, a key with no ':' (`{a, b: 1}`); its value is null.
+                        if !seq {
+                            top(stack).want = Want::BareKey(m);
+                        }
+                        Ok(Step::Node { block: false, indentless: false })
+                    }
+                }
+            }
+        }
+    }
+
+    /// A finished value for the innermost open collection.
+    fn deliver(&mut self, open: &mut Open, v: Value) -> Result<Step, Error> {
+        match std::mem::replace(&mut open.want, Want::Item) {
+            Want::Item => {
+                open.items.push(v);
+                Ok(Step::Next)
+            }
+            Want::Key(m) => {
+                let merge = self.is_merge(&v);
+                self.start_value(open, v, merge, m)
+            }
+            Want::BareKey(m) => {
+                let merge = self.is_merge(&v);
+                open.add(v, Value::Null, merge, m)?;
+                Ok(Step::Next)
+            }
+            Want::Value { key, merge, m } => {
+                open.add(key, v, merge, m)?;
+                Ok(Step::Next)
+            }
+        }
+    }
+
+    /// A mapping entry (or a pair in a flow sequence) starting with token `k`: its key after
+    /// the `?` if there is one, then its value.
+    fn start_entry(&mut self, open: &mut Open, k: K, m: Mark) -> Result<Step, Error> {
+        if k == K::Key {
+            self.skip()?;
+            let next = self.peek()?.0;
+            if next != K::Value && !open.kind.ends_entry(next) {
+                open.want = Want::Key(m);
+                let block = open.kind.is_block();
+                return Ok(Step::Node { block, indentless: block });
+            }
+        }
+        self.start_value(open, Value::Null, false, m)
+    }
+
+    fn start_value(&mut self, open: &mut Open, key: Value, merge: bool, m: Mark) -> Result<Step, Error> {
+        if self.peek()?.0 == K::Value {
+            self.skip()?;
+            if !open.kind.ends_entry(self.peek()?.0) {
+                open.want = Want::Value { key, merge, m };
+                let block = open.kind.is_block();
+                return Ok(Step::Node { block, indentless: block });
+            }
+        }
+        open.add(key, Value::Null, merge, m)?;
+        Ok(Step::Next)
+    }
+
+    /// Close the innermost open collection.
+    fn close(&mut self, stack: &mut Vec<Open>) -> Result<Step, Error> {
+        let open = stack.pop().expect("an open collection");
+        let value = match open.kind {
+            Kind::BlockMap { .. } | Kind::FlowMap { .. } => open.entries.finish(),
+            _ => Value::Seq(open.items),
+        };
+        Ok(Step::Done(self.finish_node(open.props, value, open.at)?))
     }
 
     #[inline(never)]
@@ -2814,146 +3113,7 @@ impl Composer {
         }
     }
 
-    fn block_seq(&mut self, depth: usize) -> Result<Value, Error> {
-        let start = self.peek()?.1;
-        self.skip()?;
-        let mut items = Vec::new();
-        loop {
-            let (k, m) = self.peek()?;
-            match k {
-                K::BlockEntry => {
-                    self.skip()?;
-                    let next = self.peek()?.0;
-                    let item =
-                        if matches!(next, K::BlockEntry | K::BlockEnd) { Value::Null } else { self.node(true, false, depth + 1)? };
-                    items.push(item);
-                }
-                K::BlockEnd => {
-                    self.skip()?;
-                    return Ok(Value::Seq(items));
-                }
-                found => return Err(self.fail(m, Fail::Misplaced { col: start.col, seq: true, found })),
-            }
-        }
-    }
-
-    fn indentless_seq(&mut self, depth: usize) -> Result<Value, Error> {
-        let mut items = Vec::new();
-        while self.peek()?.0 == K::BlockEntry {
-            self.skip()?;
-            let next = self.peek()?.0;
-            let item = if matches!(next, K::BlockEntry | K::Key | K::Value | K::BlockEnd) {
-                Value::Null
-            } else {
-                self.node(true, false, depth + 1)?
-            };
-            items.push(item);
-        }
-        Ok(Value::Seq(items))
-    }
-
-    fn block_map(&mut self, depth: usize) -> Result<Value, Error> {
-        let start = self.peek()?.1;
-        self.skip()?;
-        let mut entries = MapEntries::default();
-        loop {
-            let (k, m) = self.peek()?;
-            match k {
-                K::Key | K::Value => {
-                    let (key, merge, value) = entry!(self, k, true, depth, K::Key | K::Value | K::BlockEnd);
-                    entries.add(key, value, merge, m)?;
-                }
-                K::BlockEnd => {
-                    self.skip()?;
-                    return Ok(entries.finish());
-                }
-                found => return Err(self.fail(m, Fail::Misplaced { col: start.col, seq: false, found })),
-            }
-        }
-    }
-
-    fn flow_seq(&mut self, depth: usize) -> Result<Value, Error> {
-        self.skip()?;
-        let mut items = Vec::new();
-        let mut first = true;
-        loop {
-            let (mut k, m) = self.peek()?;
-            if k == K::FlowSeqEnd {
-                self.skip()?;
-                return Ok(Value::Seq(items));
-            }
-            if matches!(k, K::StreamEnd | K::DocStart | K::DocEnd) {
-                return Err(self.fail(m, Fail::Unterminated { seq: true }));
-            }
-            if !first {
-                if k != K::FlowEntry {
-                    return Err(self.fail(m, Fail::Separator { seq: true }));
-                }
-                self.skip()?;
-                k = self.peek()?.0;
-                if matches!(k, K::FlowSeqEnd | K::StreamEnd | K::DocStart | K::DocEnd) {
-                    continue;
-                }
-            }
-            first = false;
-            match k {
-                K::Key | K::Value => {
-                    let (key, _, value) = entry!(self, k, false, depth, K::FlowEntry | K::FlowSeqEnd);
-                    items.push(Value::Map(vec![(key, value)]));
-                }
-                K::FlowEntry => {
-                    let m = self.peek()?.1;
-                    return Err(self.fail(m, Fail::EmptyEntry { seq: true }));
-                }
-                _ => {
-                    let item = self.node(false, false, depth + 1)?;
-                    items.push(item);
-                }
-            }
-        }
-    }
-
-    fn flow_map(&mut self, depth: usize) -> Result<Value, Error> {
-        self.skip()?;
-        let mut entries = MapEntries::default();
-        let mut first = true;
-        loop {
-            let (mut k, mut m) = self.peek()?;
-            if k == K::FlowMapEnd {
-                self.skip()?;
-                return Ok(entries.finish());
-            }
-            if matches!(k, K::StreamEnd | K::DocStart | K::DocEnd) {
-                return Err(self.fail(m, Fail::Unterminated { seq: false }));
-            }
-            if !first {
-                if k != K::FlowEntry {
-                    return Err(self.fail(m, Fail::Separator { seq: false }));
-                }
-                self.skip()?;
-                (k, m) = self.peek()?;
-                if matches!(k, K::FlowMapEnd | K::StreamEnd | K::DocStart | K::DocEnd) {
-                    continue;
-                }
-            }
-            first = false;
-            match k {
-                K::Key | K::Value => {
-                    let (key, merge, value) = entry!(self, k, false, depth, K::FlowEntry | K::FlowMapEnd);
-                    entries.add(key, value, merge, m)?;
-                }
-                K::FlowEntry => return Err(self.fail(m, Fail::EmptyEntry { seq: false })),
-                _ => {
-                    // A key with no ':' has a null value: `{a, b: 1}`.
-                    let key = self.node(false, false, depth + 1)?;
-                    let merge = self.is_merge(&key);
-                    entries.add(key, Value::Null, merge, m)?;
-                }
-            }
-        }
-    }
-
-    // ---- non-recursive helpers for the functions above ----
+    // ---- helpers for composing ----
 
     fn skip(&mut self) -> Result<(), Error> {
         self.next().map(drop)
@@ -3024,7 +3184,7 @@ impl Composer {
     fn remember(&mut self, anchor: Option<String>, value: &Value) {
         if let Some(a) = anchor {
             self.open_anchors.pop();
-            self.anchors.insert(a, (value.clone(), count_nodes(value)));
+            self.anchors.insert(a, (value.clone(), count_values(value)));
         }
     }
 

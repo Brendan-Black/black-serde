@@ -26,9 +26,9 @@ use crate::{Deserialize, Error, Format, Limits, Serialize, Value, walk};
 
 pub const MAGIC: &[u8; 4] = b"BSRD";
 pub const VERSION: u8 = 2;
-/// The default limit on nesting; see [`Limits`]. It leaves room to spare on a 1 MB stack (a
-/// Windows main thread) even in a debug build.
-pub const MAX_DEPTH: usize = 128;
+/// The default limit on nesting; see [`Limits`]. Decoding and encoding don't recurse, so this
+/// is a policy, not a protection for the stack.
+pub const MAX_DEPTH: usize = 256;
 
 /// The magic bytes and the tag byte of each kind of value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

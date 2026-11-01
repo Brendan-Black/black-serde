@@ -9,7 +9,8 @@ use crate::Error;
 /// Types turn themselves into a `Value` ([`Serialize`](crate::Serialize)) and back
 /// ([`Deserialize`](crate::Deserialize)); a [`Format`](crate::Format) turns a `Value` into bytes
 /// and back.
-#[derive(Clone, Debug, PartialEq)]
+// Clone and PartialEq are written out (below) so that deep values don't recurse.
+#[derive(Debug)]
 pub enum Value {
     Null,
     Bool(bool),
@@ -283,47 +284,168 @@ pub(crate) fn walk(
     Ok(())
 }
 
-/// Structural equality where floats compare by their bits, so NaN equals itself and `0.0`
-/// differs from `-0.0`. Used for map keys and for finding repeated subtrees.
-pub(crate) fn same(a: &Value, b: &Value) -> bool {
-    match (a, b) {
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
-        (Value::Seq(x), Value::Seq(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same(a, b)),
-        (Value::Map(x), Value::Map(y)) => {
-            x.len() == y.len() && x.iter().zip(y).all(|((ka, va), (kb, vb))| same(ka, kb) && same(va, vb))
+/// Compare two values without recursing. With `bits`, floats compare by their bits, so NaN
+/// equals itself and `0.0` differs from `-0.0`; otherwise they compare as numbers.
+fn equal(a: &Value, b: &Value, bits: bool) -> bool {
+    let mut stack = vec![(a, b)];
+    while let Some((a, b)) = stack.pop() {
+        match (a, b) {
+            (Value::Null, Value::Null) => {}
+            (Value::Bool(x), Value::Bool(y)) if x == y => {}
+            (Value::Int(x), Value::Int(y)) if x == y => {}
+            (Value::UInt(x), Value::UInt(y)) if x == y => {}
+            (Value::Float(x), Value::Float(y)) if (bits && x.to_bits() == y.to_bits()) || (!bits && x == y) => {}
+            (Value::String(x), Value::String(y)) if x == y => {}
+            (Value::Bytes(x), Value::Bytes(y)) if x == y => {}
+            (Value::Seq(x), Value::Seq(y)) if x.len() == y.len() => stack.extend(x.iter().zip(y)),
+            (Value::Map(x), Value::Map(y)) if x.len() == y.len() => {
+                for ((ka, va), (kb, vb)) in x.iter().zip(y) {
+                    stack.push((ka, kb));
+                    stack.push((va, vb));
+                }
+            }
+            (Value::Tagged(ta, x), Value::Tagged(tb, y)) if ta == tb => stack.push((x, y)),
+            _ => return false,
         }
-        (Value::Tagged(ta, a), Value::Tagged(tb, b)) => ta == tb && same(a, b),
-        _ => a == b,
+    }
+    true
+}
+
+/// Equality as numbers for floats (so NaN differs from itself, as with `f64`).
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        equal(self, other, false)
     }
 }
 
-/// A hash consistent with [`same`].
+/// Cloning nested containers the usual way recurses once per level; this keeps a heap stack
+/// instead, so deep values clone without overflowing the stack.
+impl Clone for Value {
+    fn clone(&self) -> Self {
+        fn shallow(v: &Value) -> Option<Value> {
+            Some(match v {
+                Value::Null => Value::Null,
+                Value::Bool(b) => Value::Bool(*b),
+                Value::Int(i) => Value::Int(*i),
+                Value::UInt(u) => Value::UInt(*u),
+                Value::Float(f) => Value::Float(*f),
+                Value::String(s) => Value::String(s.clone()),
+                Value::Bytes(b) => Value::Bytes(b.clone()),
+                _ => return None,
+            })
+        }
+        if let Some(v) = shallow(self) {
+            return v;
+        }
+        enum Job<'a> {
+            Visit(&'a Value),
+            Seq(usize),
+            Map(usize),
+            Tagged(&'a str),
+        }
+        let mut jobs = vec![Job::Visit(self)];
+        // Finished copies, in order; a container's job takes its children off the end.
+        let mut done: Vec<Value> = Vec::new();
+        while let Some(job) = jobs.pop() {
+            match job {
+                Job::Visit(v) => match v {
+                    Value::Seq(items) => {
+                        jobs.push(Job::Seq(items.len()));
+                        jobs.extend(items.iter().rev().map(Job::Visit));
+                    }
+                    Value::Map(pairs) => {
+                        jobs.push(Job::Map(pairs.len()));
+                        for (k, item) in pairs.iter().rev() {
+                            jobs.push(Job::Visit(item));
+                            jobs.push(Job::Visit(k));
+                        }
+                    }
+                    Value::Tagged(tag, inner) => {
+                        jobs.push(Job::Tagged(tag));
+                        jobs.push(Job::Visit(inner));
+                    }
+                    scalar => done.push(shallow(scalar).expect("a scalar")),
+                },
+                Job::Seq(n) => {
+                    let items = done.split_off(done.len() - n);
+                    done.push(Value::Seq(items));
+                }
+                Job::Map(n) => {
+                    let mut flat = done.split_off(done.len() - 2 * n).into_iter();
+                    let mut pairs = Vec::with_capacity(n);
+                    while let (Some(k), Some(v)) = (flat.next(), flat.next()) {
+                        pairs.push((k, v));
+                    }
+                    done.push(Value::Map(pairs));
+                }
+                Job::Tagged(tag) => {
+                    let inner = done.pop().expect("the tagged value");
+                    done.push(Value::Tagged(tag.to_string(), Box::new(inner)));
+                }
+            }
+        }
+        done.pop().expect("the copy")
+    }
+}
+
+/// The number of values in `v`, keys included, counted without recursing.
+pub(crate) fn count_values(v: &Value) -> usize {
+    let mut n = 0;
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Seq(items) => {
+                n += 1;
+                stack.extend(items);
+            }
+            Value::Map(pairs) => {
+                n += 1;
+                for (k, item) in pairs {
+                    stack.push(k);
+                    stack.push(item);
+                }
+            }
+            Value::Tagged(_, inner) => stack.push(inner),
+            _ => n += 1,
+        }
+    }
+    n
+}
+
+/// Structural equality where floats compare by their bits, so NaN equals itself and `0.0`
+/// differs from `-0.0`. Used for map keys and for finding repeated subtrees.
+pub(crate) fn same(a: &Value, b: &Value) -> bool {
+    equal(a, b, true)
+}
+
+/// A hash consistent with [`same`], computed without recursing.
 pub(crate) fn hash_value<H: Hasher>(v: &Value, h: &mut H) {
-    std::mem::discriminant(v).hash(h);
-    match v {
-        Value::Null => {}
-        Value::Bool(b) => b.hash(h),
-        Value::Int(i) => i.hash(h),
-        Value::UInt(u) => u.hash(h),
-        Value::Float(f) => f.to_bits().hash(h),
-        Value::String(s) => s.hash(h),
-        Value::Bytes(b) => b.hash(h),
-        Value::Seq(items) => {
-            items.len().hash(h);
-            for item in items {
-                hash_value(item, h);
+    let mut stack = vec![v];
+    while let Some(v) = stack.pop() {
+        std::mem::discriminant(v).hash(h);
+        match v {
+            Value::Null => {}
+            Value::Bool(b) => b.hash(h),
+            Value::Int(i) => i.hash(h),
+            Value::UInt(u) => u.hash(h),
+            Value::Float(f) => f.to_bits().hash(h),
+            Value::String(s) => s.hash(h),
+            Value::Bytes(b) => b.hash(h),
+            Value::Seq(items) => {
+                items.len().hash(h);
+                stack.extend(items.iter().rev());
             }
-        }
-        Value::Map(pairs) => {
-            pairs.len().hash(h);
-            for (k, item) in pairs {
-                hash_value(k, h);
-                hash_value(item, h);
+            Value::Map(pairs) => {
+                pairs.len().hash(h);
+                for (k, item) in pairs.iter().rev() {
+                    stack.push(item);
+                    stack.push(k);
+                }
             }
-        }
-        Value::Tagged(t, inner) => {
-            t.hash(h);
-            hash_value(inner, h);
+            Value::Tagged(t, inner) => {
+                t.hash(h);
+                stack.push(inner);
+            }
         }
     }
 }

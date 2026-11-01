@@ -53,7 +53,7 @@ pub use error::{Error, ErrorKind, Limit, Position, Segment};
 pub use limits::Limits;
 pub use value::Value;
 
-pub(crate) use value::{KeyIndex, hash_value, same, walk};
+pub(crate) use value::{KeyIndex, count_values, hash_value, same, walk};
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash};

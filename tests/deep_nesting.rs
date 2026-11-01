@@ -98,3 +98,50 @@ fn dropping_deep_values_doesnt_recurse() {
         drop(t);
     });
 }
+
+#[test]
+fn yaml_goes_as_deep_as_the_limit_allows() {
+    use black_serde::yaml::Yaml;
+    on_small_stack(|| {
+        let unlimited = Limits { max_depth: usize::MAX, ..Limits::YAML };
+        // A million levels in flow style: [[[...[1]...]]].
+        let depth = 1_000_000;
+        let v = deep_value(depth);
+        let yaml = Yaml::new().flow_from(0).with_limits(unlimited);
+        let text = yaml.write(&v).unwrap();
+        assert_eq!(text.len(), 2 * depth + 2);
+        let back = yaml.read(&text).unwrap();
+        assert!(back == v, "flow round trip");
+
+        // Block style indents every level, so the text grows with the square of the depth;
+        // a few thousand levels is plenty to have overflowed a recursive parser.
+        let mut m = Value::Int(1);
+        for _ in 0..3000 {
+            m = Value::map([("k", m)]);
+        }
+        let block = Yaml::new().with_limits(unlimited);
+        let text = block.write(&m).unwrap();
+        assert!(text.starts_with("k:\n  k:\n    k:"));
+        assert!(block.read(&text).unwrap() == m, "block round trip");
+
+        // Anchors and aliases on deep subtrees: the anchored copy is cloned, compared and
+        // hashed, none of which may recurse either.
+        let doc = Value::map([("a", deep_value(200_000)), ("b", deep_value(200_000))]);
+        let text = yaml.write(&doc).unwrap();
+        assert!(text.contains("&a") && text.contains("*a"));
+        assert!(yaml.read(&text).unwrap() == doc, "anchor round trip");
+    });
+}
+
+#[test]
+fn deep_values_clone_and_compare_without_recursing() {
+    on_small_stack(|| {
+        let v = deep_value(1_000_000);
+        let copy = v.clone();
+        assert!(copy == v);
+        let mut other = deep_value(999_999);
+        other = Value::Seq(vec![other]);
+        assert!(other == v);
+        assert!(Value::Seq(vec![deep_value(999_999), Value::Null]) != v);
+    });
+}

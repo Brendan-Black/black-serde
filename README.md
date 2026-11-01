@@ -125,19 +125,18 @@ conversion allowed.
 Readers and writers reject input or values that go over a limit, with an error whose
 `limit()` says which: `Limit::Depth`, `Limit::InputSize` or `Limit::AliasValues`.
 
-JSON and binary keep their own stack instead of recursing, and dropping a `Value` doesn't
-recurse either, so for them `max_depth` is only a policy: a million levels round-trip on a
-1 MB stack once the limit allows it. YAML still recurses, so its limit also protects the
-stack.
+Nothing in black-serde recurses on the shape of a value: every reader and writer keeps its own
+stack, and so do dropping, cloning, comparing and hashing a `Value`. So `max_depth` is only a
+policy, not a protection for the thread's stack: once the limit allows it, a million levels
+of nesting round-trip through every format on a 1 MB stack (a Windows main thread) in a debug
+build, which `tests/deep_nesting.rs` checks. The exceptions are `Deserialize` impls for nested
+Rust types, which follow the type's own structure, and `Value`'s derived `Debug`.
 
 | Limit | JSON | YAML | Binary |
 | --- | --- | --- | --- |
-| `max_depth` (nesting) | 256 | 100 | 128 |
+| `max_depth` (nesting) | 256 | 256 | 256 |
 | `max_input_bytes` | 256 MiB | 256 MiB | 256 MiB |
 | `max_alias_values` | | 1,000,000 | |
-
-The depth defaults leave room to spare on a 1 MB stack (a Windows main thread) even in a debug
-build, which `tests/deep_nesting.rs` checks.
 
 To change them, either pass them in code (`Json::default().with_limits(Limits { max_depth: 1000,
 ..Limits::JSON })`), or set environment variables: `BLACK_SERDE_<FORMAT>_<LIMIT>`, then
