@@ -58,6 +58,31 @@ impl Value {
         Err(self)
     }
 
+    /// A string's text, taken without copying; any other value is given back unchanged.
+    pub fn into_string(mut self) -> Result<String, Value> {
+        if let Value::String(s) = &mut self {
+            return Ok(std::mem::take(s));
+        }
+        Err(self)
+    }
+
+    /// A byte buffer, taken without copying; any other value is given back unchanged.
+    pub fn into_bytes(mut self) -> Result<Vec<u8>, Value> {
+        if let Value::Bytes(b) = &mut self {
+            return Ok(std::mem::take(b));
+        }
+        Err(self)
+    }
+
+    /// A tagged value's tag and content, taken without copying; any other value is given back
+    /// unchanged.
+    pub fn into_tagged(mut self) -> Result<(String, Value), Value> {
+        if let Value::Tagged(tag, inner) = &mut self {
+            return Ok((std::mem::take(tag), std::mem::replace(&mut **inner, Value::Null)));
+        }
+        Err(self)
+    }
+
     /// The value with any tags removed.
     pub fn untagged(&self) -> &Value {
         let mut v = self;
@@ -233,23 +258,23 @@ enum Step<'a> {
 }
 
 /// Add `path` (outermost first) to an error about the value at its end.
-fn with_path(mut e: Error, path: &[Step]) -> Error {
-    for step in path.iter().rev() {
-        e = match step {
-            Step::Index(i) => e.in_index(*i),
-            Step::Key(k) => e.in_key(&k.key_text()),
-        };
-    }
-    e
+fn with_path(e: Error, path: &[Step]) -> Error {
+    let segments = path
+        .iter()
+        .map(|step| match step {
+            Step::Index(i) => crate::Segment::Index(*i),
+            Step::Key(k) => crate::Segment::Key(k.key_text()),
+        })
+        .collect();
+    e.in_path(segments)
 }
 
 /// Visit every value in `root`, keys included, without recursing. `check` sees each value; an
 /// error from it gets the value's path. A value inside more than `max_depth` sequences and
-/// maps is a depth-limit error for `format`. Tags don't add depth.
+/// maps is a depth-limit error. Tags don't add depth.
 pub(crate) fn walk(
     root: &Value,
     max_depth: usize,
-    format: &str,
     mut check: impl FnMut(&Value) -> Result<(), Error>,
 ) -> Result<(), Error> {
     // (value, depth, path length including this value's own step, its step)
@@ -262,7 +287,7 @@ pub(crate) fn walk(
         }
         if depth > max_depth {
             let limits = crate::Limits { max_depth, ..crate::Limits::JSON };
-            return Err(with_path(limits.depth_error(format), &path));
+            return Err(with_path(limits.depth_error(), &path));
         }
         check(v).map_err(|e| with_path(e, &path))?;
         match v {
@@ -294,6 +319,9 @@ fn equal(a: &Value, b: &Value, bits: bool) -> bool {
             (Value::Bool(x), Value::Bool(y)) if x == y => {}
             (Value::Int(x), Value::Int(y)) if x == y => {}
             (Value::UInt(x), Value::UInt(y)) if x == y => {}
+            // `UInt` is meant only for values above `i64::MAX`, but nothing stops `UInt(5)`;
+            // it's the same number as `Int(5)`.
+            (Value::Int(i), Value::UInt(u)) | (Value::UInt(u), Value::Int(i)) if u64::try_from(*i) == Ok(*u) => {}
             (Value::Float(x), Value::Float(y)) if (bits && x.to_bits() == y.to_bits()) || (!bits && x == y) => {}
             (Value::String(x), Value::String(y)) if x == y => {}
             (Value::Bytes(x), Value::Bytes(y)) if x == y => {}
@@ -388,26 +416,34 @@ impl Clone for Value {
     }
 }
 
-/// The number of values in `v`, keys included, counted without recursing.
-pub(crate) fn count_values(v: &Value) -> usize {
-    let mut n = 0;
+/// What copying `v` costs, in values (keys included), with each string, byte buffer and tag
+/// also counting one value per [`BYTES_PER_VALUE`](crate::limits::BYTES_PER_VALUE) bytes, so
+/// that a copied 1 MB string isn't counted as one small value. Counted without recursing.
+pub(crate) fn copy_cost(v: &Value) -> usize {
+    let text = |len: usize| len / crate::limits::BYTES_PER_VALUE;
+    let mut n: usize = 0;
     let mut stack = vec![v];
     while let Some(v) = stack.pop() {
-        match v {
+        n = n.saturating_add(match v {
             Value::Seq(items) => {
-                n += 1;
                 stack.extend(items);
+                1
             }
             Value::Map(pairs) => {
-                n += 1;
                 for (k, item) in pairs {
                     stack.push(k);
                     stack.push(item);
                 }
+                1
             }
-            Value::Tagged(_, inner) => stack.push(inner),
-            _ => n += 1,
-        }
+            Value::Tagged(tag, inner) => {
+                stack.push(inner);
+                text(tag.len())
+            }
+            Value::String(s) => 1 + text(s.len()),
+            Value::Bytes(b) => 1 + text(b.len()),
+            _ => 1,
+        });
     }
     n
 }
@@ -422,6 +458,14 @@ pub(crate) fn same(a: &Value, b: &Value) -> bool {
 pub(crate) fn hash_value<H: Hasher>(v: &Value, h: &mut H) {
     let mut stack = vec![v];
     while let Some(v) = stack.pop() {
+        // A `UInt` that fits in `i64` equals the `Int` with the same value, so hash it as one.
+        if let Value::UInt(u) = *v
+            && let Ok(i) = i64::try_from(u)
+        {
+            std::mem::discriminant(&Value::Int(0)).hash(h);
+            i.hash(h);
+            continue;
+        }
         std::mem::discriminant(v).hash(h);
         match v {
             Value::Null => {}
@@ -456,19 +500,38 @@ pub(crate) fn key_hash(v: &Value) -> u64 {
     h.finish()
 }
 
-/// Finds keys already in a list of pairs without comparing against every one.
+/// Finds keys already in a list of pairs without comparing against every one. Small maps,
+/// the common case, are searched directly; the hash index is built once a map grows past
+/// [`KeyIndex::LINEAR`] keys.
 #[derive(Default)]
 pub(crate) struct KeyIndex {
-    by_hash: std::collections::HashMap<u64, Vec<usize>>,
+    by_hash: Option<std::collections::HashMap<u64, Vec<usize>>>,
 }
 
 impl KeyIndex {
+    const LINEAR: usize = 16;
+
+    /// The index in `pairs` (every pair inserted so far) of a key equal to `key`.
     pub(crate) fn find(&self, pairs: &[(Value, Value)], key: &Value) -> Option<usize> {
-        self.by_hash.get(&key_hash(key))?.iter().copied().find(|&i| same(&pairs[i].0, key))
+        match &self.by_hash {
+            None => pairs.iter().position(|(k, _)| same(k, key)),
+            Some(m) => m.get(&key_hash(key))?.iter().copied().find(|&i| same(&pairs[i].0, key)),
+        }
     }
 
-    pub(crate) fn insert(&mut self, key: &Value, index: usize) {
-        self.by_hash.entry(key_hash(key)).or_default().push(index);
+    /// Record `key` as about to be pushed onto `pairs` at `index` (`pairs.len()`).
+    pub(crate) fn insert(&mut self, pairs: &[(Value, Value)], key: &Value, index: usize) {
+        if self.by_hash.is_none() {
+            if index + 1 < Self::LINEAR {
+                return;
+            }
+            let mut m: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+            for (i, (k, _)) in pairs[..index].iter().enumerate() {
+                m.entry(key_hash(k)).or_default().push(i);
+            }
+            self.by_hash = Some(m);
+        }
+        self.by_hash.as_mut().expect("built above").entry(key_hash(key)).or_default().push(index);
     }
 }
 

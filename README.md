@@ -45,11 +45,25 @@ let back: Point = black_serde::yaml::from_str(&yaml)?;
 Deserialization errors include the path to the bad value, e.g.
 `events[3].button: unknown mouse button "huge"`.
 
-Built-in impls cover `bool`, all integer types (range-checked), `f32`/`f64`, `char`, `String`,
-`Option`, `Box`, `Vec`, arrays, tuples up to 6, `HashMap`/`BTreeMap` with any key type (`HashMap`
-is written in sorted key order, so output is deterministic), `()`, `Value`, `Bytes` (a byte
-buffer stored compactly in binary and as `!!binary` in YAML) and `Tagged<T>`. Map keys convert
-between text and scalars as needed, so `HashMap<u32, _>` round-trips through JSON's string keys.
+To reject misspelled fields instead of ignoring them, add `.deny_unknown(&["x", "y", "label"])?`
+after `Fields::new(v)?`.
+
+Built-in impls cover `bool`, the integer types up to 64 bits (range-checked; `i128`/`u128` aren't
+supported), `f32`/`f64` (an `f32` out of range is an error), `char`, `String`, `Option`, `Box`,
+`Vec`, arrays, tuples up to 6, `HashMap`/`BTreeMap` with any key type (`HashMap` is written in
+sorted key order, so output is deterministic), `()`, `Value`, `Bytes` (a byte buffer stored
+compactly in binary and as `!!binary` in YAML) and `Tagged<T>`. Map keys convert between text
+and scalars as needed, so `HashMap<u32, _>` round-trips through JSON's string keys; only a
+scalar's canonical text converts (`"10"`, not `"010"` or `"0xA"`), and two keys that convert to
+the same one are an error rather than one silently replacing the other.
+
+`Option` writes `None` as null, so null always reads back as `None`: `Some(None)` in an
+`Option<Option<T>>` (or `Some(())`) can't be told apart from `None`.
+
+Deserializing goes through a `Value`, and `Deserialize` borrows it, so strings and byte buffers
+are copied out of it. That keeps the traits simple at the cost of speed; code that owns a
+`Value` can move parts out with `into_string`, `into_bytes`, `into_seq`, `into_map` and
+`into_tagged`.
 
 ## YAML
 
@@ -59,12 +73,22 @@ scalars, comments, anchors and aliases, tags (shorthand, `%TAG` and verbatim), d
 multi-document streams (`yaml::parse_all`).
 
 - **Aliases** become copies of their anchored value. An alias inside its own anchor is an error
-  (a cycle can't be a tree), and so is expanding more than `max_alias_values` values.
-- **Merge keys** (`<<: *defaults`) are applied; turn them off with `Yaml::merge_keys(false)`.
+  (a cycle can't be a tree), and so is copying more than `max_alias_values` values (see
+  Limits).
+- **Merge keys** (`<<: *defaults`) are applied, as most YAML in the wild expects, though YAML 1.2
+  dropped them; turn them off with `Yaml::merge_keys(false)`.
 - **Tags**: the standard ones set the type (`!!binary` gives bytes, `!!omap` an ordered map);
   any other tag is kept as `Value::Tagged` with its full name.
+- **Duplicate keys** are an error, as the spec requires.
 
-Writing anchors repeated subtrees and writes the copies as aliases:
+Writing uses literal block scalars for multi-line strings, `!!binary` for bytes, tags, and
+`? key` for keys that aren't scalars or are too long to be implicit. Strings are quoted whenever
+a reader could take them for something else, including YAML 1.1 readers such as PyYAML
+(`"no"`, `"on"`, `"1_000"`, `"12:30"`). `Yaml::block_strings(false)` writes every string on one
+line.
+
+`Yaml::anchors(n)` writes repeated subtrees of at least `n` values once, with an anchor named
+after the key it first appears under, and the copies as aliases:
 
 ```yaml
 defaults: &defaults
@@ -73,9 +97,7 @@ defaults: &defaults
 a: *defaults
 ```
 
-Anchors are named after the key the subtree first appears under. Writing also uses literal
-block scalars for multi-line strings, `!!binary` for bytes, tags and `? key` for keys that
-aren't scalars. `Yaml::no_anchors()` and `Yaml::block_strings(false)` turn those off.
+It's off by default: output meant for people reads and diffs better without it.
 
 The official [YAML test suite](https://github.com/yaml/yaml-test-suite) runs with
 `tests/yaml_test_suite.rs` (see the file for how). 398 of its 402 cases pass. The other four are
@@ -101,7 +123,8 @@ angle.write(&value)?;  // <|"text":"a <| b |> c"|>
 The tokens are recognized by the tokenizer, not substituted into the text, so strings can
 contain them freely. A token set is checked before use and rejected if two tokens could be
 confused where both can appear (one being a prefix of the other, a closing token that looks
-like more of a number, and so on).
+like more of a number, a closing quote that starts with what it ends with, like `''`, and so
+on).
 
 ## Errors instead of silent changes
 
@@ -111,10 +134,15 @@ saying so, and `err.kind()` tells the cases apart:
 - `ErrorKind::Invalid`: the input is wrong (bad syntax, or a value of the wrong type).
 - `ErrorKind::Limit(_)`: the input or value went over a limit (below).
 - `ErrorKind::Unrepresentable`: the format can't write the value as it is. JSON can't write
-  NaN or infinities, keys that aren't strings, tags or bytes. YAML can't write two tags on one
-  value, a tag on bytes, or an empty tag. Each lossy conversion can be allowed on its own
+  NaN or infinities, keys that aren't strings, tags or bytes. YAML can't write a tag that
+  wouldn't read back as the same tag on the same value: two tags on one value, a tag on bytes,
+  an empty tag or `!`, or a standard tag that readers apply rather than keep (`!!int`, `!!str`,
+  `!!seq`, ...). Each lossy conversion can be allowed on its own
   (`JsonLossy { non_finite_floats: true, ..JsonLossy::NONE }`, `YamlLossy::ALL`), and then
   happens as documented.
+
+Reading is just as strict: JSON objects with duplicate keys and numbers too large for a
+float are errors, as are YAML duplicate keys and malformed escapes.
 
 Errors give the path to the problem, e.g. `scores[1]: JSON can't write NaN`. `Value`'s
 `Display` is the one writer that never fails: it shows compact JSON with every lossy
@@ -138,11 +166,22 @@ Rust types, which follow the type's own structure, and `Value`'s derived `Debug`
 | `max_input_bytes` | 256 MiB | 256 MiB | 256 MiB |
 | `max_alias_values` | | 1,000,000 | |
 
-To change them, either pass them in code (`Json::default().with_limits(Limits { max_depth: 1000,
-..Limits::JSON })`), or set environment variables: `BLACK_SERDE_<FORMAT>_<LIMIT>`, then
-`BLACK_SERDE_<LIMIT>`, e.g. `BLACK_SERDE_YAML_MAX_DEPTH=50` or `BLACK_SERDE_MAX_INPUT_BYTES=1G`.
-Values are numbers with an optional `K`, `M` or `G` suffix, or `unlimited`. A variable set to
-anything else makes reading fail, so a typo can't silently leave the default in place.
+`max_alias_values` bounds what YAML copies for aliases, so "billion laughs" input fails instead
+of filling memory. It counts values, plus one value per 32 bytes of each copied string, so
+1,000 aliases of a 1 MB string count as about 32 million. Remembering anchored values (each
+anchor keeps a copy for its aliases) is allowed up to `max_alias_values` plus the input's size,
+which covers any ordinary document but not hundreds of nested anchors around the same data.
+
+Binary input can't make the reader reserve memory it hasn't seen: a container's count is
+checked against the bytes left, and only a little room is reserved up front.
+
+To change the limits, pass them in code: `Json::default().with_limits(Limits { max_depth:
+1000, ..Limits::JSON })`. Nothing is read from the environment unless the program asks:
+`Limits::from_env("YAML", Limits::YAML)?` applies `BLACK_SERDE_YAML_<LIMIT>` and then
+`BLACK_SERDE_<LIMIT>` variables (e.g. `BLACK_SERDE_YAML_MAX_DEPTH=50`,
+`BLACK_SERDE_MAX_INPUT_BYTES=1G`). Values are numbers with an optional `K`, `M` or `G` suffix,
+or `unlimited`; anything else is an error, so a typo can't silently leave the default in
+place.
 
 ## Adding a format
 

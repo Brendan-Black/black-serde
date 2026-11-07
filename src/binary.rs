@@ -30,6 +30,11 @@ pub const VERSION: u8 = 2;
 /// is a policy, not a protection for the stack.
 pub const MAX_DEPTH: usize = 256;
 
+/// The most items a container's count may reserve room for up front. A count is checked
+/// against the bytes left, but every nested container could claim the same bytes, so trusting
+/// counts fully would let a small input reserve gigabytes. Larger containers grow as read.
+const PREALLOCATE: usize = 1024;
+
 /// The magic bytes and the tag byte of each kind of value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BinaryTokens {
@@ -118,16 +123,16 @@ impl Binary {
         Ok(self)
     }
 
-    /// Use these limits instead of the defaults and environment variables.
+    /// Use these limits instead of the defaults ([`Limits::BINARY`]).
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = Some(limits);
         self
     }
 
-    /// The limits decoding uses: those set with [`with_limits`](Binary::with_limits), or else
-    /// the defaults with any environment variables applied.
-    pub fn limits(&self) -> Result<Limits, Error> {
-        self.limits.map_or_else(|| Limits::from_env("BINARY", Limits::BINARY), Ok)
+    /// The limits encoding and decoding use: those set with
+    /// [`with_limits`](Binary::with_limits), or else [`Limits::BINARY`].
+    pub fn limits(&self) -> Limits {
+        self.limits.unwrap_or(Limits::BINARY)
     }
 
     pub fn tokens(&self) -> &BinaryTokens {
@@ -140,13 +145,13 @@ impl Format for Binary {
     /// whole data model.
     fn encode(&self, value: &Value) -> Result<Vec<u8>, Error> {
         let t = &self.tokens;
-        let max_depth = self.limits()?.max_depth;
+        let max_depth = self.limits().max_depth;
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(t.magic);
         out.push(VERSION);
         // The layout is the values in depth-first order, each container followed by its
         // contents, so walking the tree in that order and writing each header is the encoding.
-        walk(value, max_depth, "BINARY", |v| {
+        walk(value, max_depth, |v| {
             write_header(&mut out, v, t);
             Ok(())
         })?;
@@ -154,8 +159,8 @@ impl Format for Binary {
     }
 
     fn decode(&self, input: &[u8]) -> Result<Value, Error> {
-        let limits = self.limits()?;
-        limits.check_input(input.len(), "BINARY")?;
+        let limits = self.limits();
+        limits.check_input(input.len())?;
         let t = &self.tokens;
         let n = t.magic.len();
         if input.len() <= n || &input[..n] != t.magic {
@@ -338,7 +343,7 @@ impl Reader<'_> {
             let mut v = if tag == t.seq {
                 let n = self.len()?;
                 if n > 0 {
-                    stack.push(Open::Seq(Vec::with_capacity(n), n));
+                    stack.push(Open::Seq(Vec::with_capacity(n.min(PREALLOCATE)), n));
                     depth += 1;
                     continue;
                 }
@@ -348,7 +353,7 @@ impl Reader<'_> {
                 if n > 0 {
                     // Version 1 keys are bare strings, read here rather than as values.
                     let key = if self.version == 1 { Some(self.string_value()?) } else { None };
-                    stack.push(Open::Map(Vec::with_capacity(n), n, key));
+                    stack.push(Open::Map(Vec::with_capacity(n.min(PREALLOCATE)), n, key));
                     depth += 1;
                     continue;
                 }
@@ -413,7 +418,7 @@ impl Reader<'_> {
             _ if tag == t.bool_false => Value::Bool(false),
             _ if tag == t.bool_true => Value::Bool(true),
             _ if tag == t.int => Value::Int(unzigzag(self.varint()?)),
-            _ if tag == t.uint => Value::UInt(self.varint()?),
+            _ if tag == t.uint => Value::from(self.varint()?),
             _ if tag == t.float => Value::Float(f64::from_le_bytes(self.take(8)?.try_into().expect("8 bytes"))),
             _ if tag == t.string => Value::String(self.string()?),
             _ if tag == t.bytes => {
@@ -430,7 +435,7 @@ impl Reader<'_> {
     #[cold]
     #[inline(never)]
     fn too_deep(&self) -> Error {
-        Limits { max_depth: self.max_depth, ..Limits::BINARY }.depth_error("BINARY").at_offset(self.pos)
+        Limits { max_depth: self.max_depth, ..Limits::BINARY }.depth_error().at_offset(self.pos)
     }
 }
 

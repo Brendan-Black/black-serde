@@ -88,7 +88,7 @@ fn writes_repeats_as_aliases() {
         ("b", Value::map([("inner", defaults.clone())])),
         ("list", seq(vec![defaults.clone(), defaults.clone()])),
     ]);
-    let text = Yaml::new().write(&v).unwrap();
+    let text = Yaml::new().anchors(3).write(&v).unwrap();
     assert_eq!(
         text,
         "defaults: &defaults\n  color: red\n  size: 3\na: *defaults\nb:\n  inner: *defaults\nlist:\n  - *defaults\n  - *defaults\n"
@@ -107,13 +107,13 @@ fn aliases_dont_count_copies_inside_aliased_copies() {
     let inner = Value::map([("p", i(1)), ("q", i(2))]);
     let outer = Value::map([("one", inner.clone()), ("two", s("x"))]);
     let v = Value::map([("first", outer.clone()), ("second", outer.clone())]);
-    let text = Yaml::new().write(&v).unwrap();
+    let text = Yaml::new().anchors(3).write(&v).unwrap();
     assert_eq!(text, "first: &first\n  one:\n    p: 1\n    q: 2\n  two: x\nsecond: *first\n");
     // Two different subtrees anchored under the same key name get distinct anchors.
     let x = Value::map([("k", i(1)), ("j", i(2))]);
     let y = Value::map([("k", i(3)), ("j", i(4))]);
     let v = seq(vec![Value::map([("item", x.clone())]), Value::map([("item", y.clone())]), x.clone(), y.clone()]);
-    let text = Yaml::new().write(&v).unwrap();
+    let text = Yaml::new().anchors(3).write(&v).unwrap();
     assert!(text.contains("&item ") || text.contains("&item\n"), "{text}");
     assert!(text.contains("&item_2"), "{text}");
     assert_eq!(parse(&text).unwrap(), v);

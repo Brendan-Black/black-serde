@@ -127,7 +127,7 @@ fn yaml_goes_as_deep_as_the_limit_allows() {
         // Anchors and aliases on deep subtrees: the anchored copy is cloned, compared and
         // hashed, none of which may recurse either.
         let doc = Value::map([("a", deep_value(200_000)), ("b", deep_value(200_000))]);
-        let text = yaml.write(&doc).unwrap();
+        let text = yaml.anchors(3).write(&doc).unwrap();
         assert!(text.contains("&a") && text.contains("*a"));
         assert!(yaml.read(&text).unwrap() == doc, "anchor round trip");
     });

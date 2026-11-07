@@ -3,34 +3,36 @@
 
 use crate::{Error, Limit};
 
-/// The prefix of the environment variables that override limits.
+/// The prefix of the environment variables [`Limits::from_env`] reads.
 pub const ENV_PREFIX: &str = "BLACK_SERDE_";
 
 const DEFAULT_MAX_INPUT_BYTES: usize = 256 << 20;
 const DEFAULT_MAX_ALIAS_VALUES: usize = 1_000_000;
 
+/// How many bytes of text count as one value toward `max_alias_values`: about the size of a
+/// [`Value`](crate::Value), so the limit tracks memory rather than just the number of nodes.
+pub(crate) const BYTES_PER_VALUE: usize = 32;
+
 /// How much a reader accepts. Going over any of these is an [`Error`] whose
 /// [`limit()`](Error::limit) says which one.
 ///
-/// Each format starts from its own defaults ([`Limits::JSON`], [`Limits::YAML`],
-/// [`Limits::BINARY`]). Environment variables override them, and limits set in code with a
-/// format's `with_limits` override both. The variables are, for each limit,
-/// `BLACK_SERDE_<FORMAT>_<LIMIT>` and then `BLACK_SERDE_<LIMIT>`, with `<LIMIT>` one of
-/// `MAX_DEPTH`, `MAX_INPUT_BYTES` and `MAX_ALIAS_VALUES`, and `<FORMAT>` one of `JSON`, `YAML`
-/// and `BINARY`. A value is a number, optionally with a `K`, `M` or `G` suffix (powers of
-/// 1024), or `unlimited`. A variable that's set to anything else makes reading fail, so a typo
-/// can't silently leave the default in place.
+/// Each format uses its own defaults ([`Limits::JSON`], [`Limits::YAML`], [`Limits::BINARY`])
+/// unless it's given others with its `with_limits`. Nothing is read from the environment
+/// unless the application asks: [`Limits::from_env`] applies `BLACK_SERDE_*` variables to a
+/// set of limits, for programs that want that knob.
 ///
-/// Raising `max_depth` far above the default can let deeply nested input overflow the stack
-/// of a thread with a small stack; the defaults fit in 1 MB, even in debug builds.
+/// Readers and writers keep their own stacks rather than recursing, so raising `max_depth`
+/// can't overflow the thread's stack.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// The deepest nesting of sequences and maps.
     pub max_depth: usize,
     /// The longest input, in bytes.
     pub max_input_bytes: usize,
-    /// The most values YAML aliases may expand to in one document (stops "billion laughs"
-    /// input). The other formats have no aliases.
+    /// How much YAML may copy for aliases and anchors in one document, counted in values
+    /// (each string or byte buffer also counts one value per 32 bytes). This stops "billion
+    /// laughs" input. Copies made to remember anchors are allowed up to this plus the size of
+    /// the input. The other formats have no aliases.
     pub max_alias_values: usize,
 }
 
@@ -51,7 +53,18 @@ impl Limits {
         max_alias_values: DEFAULT_MAX_ALIAS_VALUES,
     };
 
-    /// `base` with the environment variables for `format` (such as `"YAML"`) applied.
+    /// `base` with environment variables applied, for programs that want limits set from
+    /// outside. For each limit it reads `BLACK_SERDE_<FORMAT>_<LIMIT>`, then
+    /// `BLACK_SERDE_<LIMIT>`, with `<LIMIT>` one of `MAX_DEPTH`, `MAX_INPUT_BYTES` and
+    /// `MAX_ALIAS_VALUES`, and `<FORMAT>` the `format` given (such as `"YAML"`). A value is a
+    /// number, optionally with a `K`, `M` or `G` suffix (powers of 1024), or `unlimited`;
+    /// anything else is an error, so a typo can't silently leave the default in place.
+    ///
+    /// ```
+    /// # use black_serde::{Limits, yaml::Yaml};
+    /// let yaml = Yaml::new().with_limits(Limits::from_env("YAML", Limits::YAML)?);
+    /// # Ok::<(), black_serde::Error>(())
+    /// ```
     pub fn from_env(format: &str, base: Limits) -> Result<Limits, Error> {
         Limits::from_lookup(format, base, |name| std::env::var(name).ok())
     }
@@ -75,12 +88,12 @@ impl Limits {
         Ok(limits)
     }
 
-    pub(crate) fn check_input(&self, len: usize, format: &str) -> Result<(), Error> {
+    pub(crate) fn check_input(&self, len: usize) -> Result<(), Error> {
         if len > self.max_input_bytes {
             return Err(Error::limit_exceeded(
                 Limit::InputSize,
                 format!(
-                    "the input is {len} bytes, more than max_input_bytes ({}); raise it with with_limits or {ENV_PREFIX}{format}_MAX_INPUT_BYTES",
+                    "the input is {len} bytes, more than max_input_bytes ({}); raise it with with_limits",
                     self.max_input_bytes
                 ),
             ));
@@ -88,11 +101,11 @@ impl Limits {
         Ok(())
     }
 
-    pub(crate) fn depth_error(&self, format: &str) -> Error {
+    pub(crate) fn depth_error(&self) -> Error {
         Error::limit_exceeded(
             Limit::Depth,
             format!(
-                "nested too deeply (more than max_depth, {} levels); raise it with with_limits or {ENV_PREFIX}{format}_MAX_DEPTH",
+                "nested too deeply (more than max_depth, {} levels); raise it with with_limits",
                 self.max_depth
             ),
         )

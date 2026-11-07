@@ -38,3 +38,16 @@ pub(crate) fn check_start(format: &str, name: &str, token: &str, chars: &str, wh
         _ => Ok(()),
     }
 }
+
+/// A closing quote token must not overlap itself (start with what it ends with, like `''` or
+/// `aba`): then text ending in part of the token runs into the real closing token, and the
+/// reader finds the end too early.
+pub(crate) fn check_no_self_overlap(format: &str, name: &str, token: &str) -> Result<(), Error> {
+    let overlap = token.char_indices().skip(1).any(|(i, _)| token.starts_with(&token[i..]));
+    if overlap {
+        return Err(Error::new(format!(
+            "{format} token {name} ({token:?}) can't start with what it ends with, or text ending in part of it would close it early"
+        )));
+    }
+    Ok(())
+}

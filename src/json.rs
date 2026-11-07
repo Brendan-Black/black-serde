@@ -4,8 +4,9 @@
 //! Writing any of them is an error unless [`JsonLossy`] allows the lossy conversion (bytes as
 //! numbers, non-finite floats as `null`, keys as their text, tags dropped). Integers that fit
 //! in `i64` read back as `Int`, larger ones that fit in `u64` as `UInt`, anything else as
-//! `Float`. Reading and writing keep their own stack instead of recursing, so nesting is
-//! limited only by `max_depth` (see [`Limits`]).
+//! `Float`; a number too large for `f64` is an error. Object keys must be unique, and a leading
+//! byte order mark is skipped. Reading and writing keep their own stack instead of recursing,
+//! so nesting is limited only by `max_depth` (see [`Limits`]).
 //!
 //! The punctuation and literal words come from [`JsonTokens`]. Change any of them, and the
 //! reader and writer both use the new spelling. Because the tokens are recognized by the
@@ -25,8 +26,8 @@
 
 use std::fmt::{self, Write as _};
 
-use crate::tokens::{check_prefix_free, check_start, check_text};
-use crate::{Deserialize, Error, Format, Limits, Serialize, Value};
+use crate::tokens::{check_no_self_overlap, check_prefix_free, check_start, check_text};
+use crate::{Deserialize, Error, Format, KeyIndex, Limits, Segment, Serialize, Value};
 
 /// The default limit on nesting; see [`Limits`].
 pub const MAX_DEPTH: usize = 256;
@@ -108,6 +109,7 @@ impl JsonTokens {
             check_start("JSON", name, tok, "0123456789.eE+-", "which would continue a number")?;
         }
         check_start("JSON", "string_close", t.string_close, "\\/bfnrtu", "which would read as an escape after '\\'")?;
+        check_no_self_overlap("JSON", "string_close", t.string_close)?;
         Ok(())
     }
 }
@@ -182,16 +184,16 @@ impl Json {
         Ok(self)
     }
 
-    /// Use these limits instead of the defaults and environment variables.
+    /// Use these limits instead of the defaults ([`Limits::JSON`]).
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = Some(limits);
         self
     }
 
     /// The limits reading and writing use: those set with [`with_limits`](Json::with_limits),
-    /// or else the defaults with any environment variables applied.
-    pub fn limits(&self) -> Result<Limits, Error> {
-        self.limits.map_or_else(|| Limits::from_env("JSON", Limits::JSON), Ok)
+    /// or else [`Limits::JSON`].
+    pub fn limits(&self) -> Limits {
+        self.limits.unwrap_or(Limits::JSON)
     }
 
     pub fn tokens(&self) -> &JsonTokens {
@@ -202,14 +204,16 @@ impl Json {
     /// is nested deeper than `max_depth`; the error's path says where.
     pub fn write(&self, value: &Value) -> Result<String, Error> {
         let mut out = String::new();
-        write_document(&mut out, value, self, self.limits()?.max_depth)?;
+        write_document(&mut out, value, self, self.limits().max_depth)?;
         Ok(out)
     }
 
-    /// Parse a complete document written with this format's tokens.
+    /// Parse a complete document written with this format's tokens. A leading byte order mark
+    /// is skipped. Object keys must be unique.
     pub fn read(&self, text: &str) -> Result<Value, Error> {
-        let limits = self.limits()?;
-        limits.check_input(text.len(), "JSON")?;
+        let limits = self.limits();
+        limits.check_input(text.len())?;
+        let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
         let mut p = Parser { src: text, pos: 0, t: &self.tokens, limits };
         p.skip_ws();
         let v = p.value()?;
@@ -227,6 +231,7 @@ impl Format for Json {
     }
 
     fn decode(&self, input: &[u8]) -> Result<Value, Error> {
+        self.limits().check_input(input.len())?;
         let text = std::str::from_utf8(input)
             .map_err(|e| Error::new("JSON input is not valid UTF-8").at_offset(e.valid_up_to()))?;
         self.read(text)
@@ -281,15 +286,16 @@ struct Frame<'a> {
 
 /// Add the position of the value being written (the innermost open containers' current items)
 /// to an error.
-fn at_path(mut e: Error, stack: &[Frame]) -> Error {
-    for frame in stack.iter().rev() {
-        e = match &frame.open {
-            Open::Seq { count, .. } => e.in_index(count.saturating_sub(1)),
-            Open::Map { key: Some(k), .. } => e.in_key(&k.key_text()),
-            Open::Map { key: None, .. } => e,
-        };
-    }
-    e
+fn at_path(e: Error, stack: &[Frame]) -> Error {
+    let path = stack
+        .iter()
+        .filter_map(|frame| match &frame.open {
+            Open::Seq { count, .. } => Some(Segment::Index(count.saturating_sub(1))),
+            Open::Map { key: Some(k), .. } => Some(Segment::Key(k.key_text())),
+            Open::Map { key: None, .. } => None,
+        })
+        .collect();
+    e.in_path(path)
 }
 
 /// Write `root`, keeping open containers on a heap stack so any depth up to `max_depth` works.
@@ -303,7 +309,7 @@ fn write_document(out: &mut String, root: &Value, opts: &Json, max_depth: usize)
             let depth = stack.len();
             if depth > max_depth {
                 let limits = Limits { max_depth, ..Limits::JSON };
-                return Err(at_path(limits.depth_error("JSON"), &stack));
+                return Err(at_path(limits.depth_error(), &stack));
             }
             if let Value::Tagged(tag, _) = v {
                 if !lossy.tags {
@@ -533,7 +539,8 @@ impl Parser<'_> {
     fn value(&mut self) -> Result<Value, Error> {
         enum Open {
             Seq(Vec<Value>),
-            Map(Vec<(Value, Value)>, Value),
+            /// Pairs so far, the key waiting for its value, and an index of the keys.
+            Map(Vec<(Value, Value)>, Value, KeyIndex),
         }
         let t = self.t;
         let mut stack: Vec<Open> = Vec::new();
@@ -541,7 +548,7 @@ impl Parser<'_> {
             // Read a scalar, or open a container and go on to its first item.
             self.skip_ws();
             if stack.len() > self.limits.max_depth {
-                return Err(self.at(self.limits.depth_error("JSON")));
+                return Err(self.at(self.limits.depth_error()));
             }
             let mut v = if self.eat(t.map_open) {
                 self.skip_ws();
@@ -549,7 +556,7 @@ impl Parser<'_> {
                     Value::Map(Vec::new())
                 } else {
                     let key = self.key()?;
-                    stack.push(Open::Map(Vec::new(), key));
+                    stack.push(Open::Map(Vec::new(), key, KeyIndex::default()));
                     continue;
                 }
             } else if self.eat(t.seq_open) {
@@ -579,17 +586,24 @@ impl Parser<'_> {
                         let Some(Open::Seq(items)) = stack.pop() else { unreachable!() };
                         v = Value::Seq(items);
                     }
-                    Some(Open::Map(pairs, key)) => {
-                        pairs.push((std::mem::replace(key, Value::Null), v));
+                    Some(Open::Map(pairs, key, index)) => {
+                        let k = std::mem::replace(key, Value::Null);
+                        index.insert(pairs, &k, pairs.len());
+                        pairs.push((k, v));
                         if self.eat(t.comma) {
                             self.skip_ws();
+                            let at = self.pos;
                             *key = self.key()?;
+                            if index.find(pairs, key).is_some() {
+                                self.pos = at;
+                                return Err(self.error(&format!("duplicate key {key}")));
+                            }
                             break;
                         }
                         if !self.eat(t.map_close) {
                             return Err(self.error(&format!("expected '{}' or '{}'", t.comma, t.map_close)));
                         }
-                        let Some(Open::Map(pairs, _)) = stack.pop() else { unreachable!() };
+                        let Some(Open::Map(pairs, ..)) = stack.pop() else { unreachable!() };
                         v = Value::Map(pairs);
                     }
                 }
@@ -760,7 +774,8 @@ impl Parser<'_> {
             }
         }
         let text = &self.src[start..self.pos];
-        if !is_float {
+        // `-0` is negative zero, which only a float can hold.
+        if !is_float && text != "-0" {
             if let Ok(i) = text.parse::<i64>() {
                 return Ok(Value::Int(i));
             }
@@ -768,7 +783,12 @@ impl Parser<'_> {
                 return Ok(Value::UInt(u));
             }
         }
-        text.parse::<f64>().map(Value::Float).map_err(|_| self.error("invalid number"))
+        let f: f64 = text.parse().map_err(|_| self.error("invalid number"))?;
+        if f.is_infinite() {
+            self.pos = start;
+            return Err(self.error("number is too large for a 64-bit float"));
+        }
+        Ok(Value::Float(f))
     }
 }
 
@@ -825,7 +845,8 @@ mod tests {
     #[test]
     fn containers() {
         assert_eq!(rt(r#" { "a" : [1, 2, {"b": null}], "c": {} , "d": [] } "#), r#"{"a":[1,2,{"b":null}],"c":{},"d":[]}"#);
-        assert_eq!(parse(r#"{"k": 1, "k": 2}"#).unwrap().get("k"), Some(&Value::Int(2)));
+        let e = parse("{\"k\": 1,\n \"k\": 2}").unwrap_err();
+        assert_eq!(e.to_string(), "duplicate key \"k\" at line 2, column 2");
         assert_eq!(parse("[10, 20]").unwrap().at(1), Some(&Value::Int(20)));
         for bad in ["[1,]", "[1 2]", "{\"a\" 1}", "{\"a\":1,}", "{1:2}", "[", "{", "]", "[1] x"] {
             assert!(parse(bad).is_err(), "{bad} should fail");

@@ -53,7 +53,7 @@ pub use error::{Error, ErrorKind, Limit, Position, Segment};
 pub use limits::Limits;
 pub use value::Value;
 
-pub(crate) use value::{KeyIndex, count_values, hash_value, same, walk};
+pub(crate) use value::{KeyIndex, copy_cost, hash_value, same, walk};
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{BuildHasher, Hash};
@@ -123,6 +123,7 @@ impl MapBuilder {
 }
 
 /// Reads fields out of a map [`Value`], for `Deserialize` impls. Errors carry the field name.
+#[derive(Debug)]
 pub struct Fields<'a>(&'a Value);
 
 impl<'a> Fields<'a> {
@@ -156,6 +157,25 @@ impl<'a> Fields<'a> {
     /// A field with a default when missing or null.
     pub fn or<T: Deserialize>(&self, name: &str, default: T) -> Result<T, Error> {
         Ok(self.opt(name)?.unwrap_or(default))
+    }
+
+    /// Fail if the map has any field not in `known`, so a misspelled field is an error
+    /// rather than silently ignored:
+    ///
+    /// ```
+    /// # use black_serde::{Fields, Value};
+    /// let v = black_serde::json::parse(r#"{"x": 1, "colour": "red"}"#)?;
+    /// let e = Fields::new(&v)?.deny_unknown(&["x", "color"]).unwrap_err();
+    /// assert_eq!(e.to_string(), "colour: unknown field (expected one of x, color)");
+    /// # Ok::<(), black_serde::Error>(())
+    /// ```
+    pub fn deny_unknown(self, known: &[&str]) -> Result<Self, Error> {
+        let pairs = self.0.as_map().expect("Fields holds a map");
+        if let Some((k, _)) = pairs.iter().find(|(k, _)| !k.as_str().is_some_and(|s| known.contains(&s))) {
+            let msg = format!("unknown field (expected one of {})", known.join(", "));
+            return Err(Error::new(msg).in_key(&k.key_text()));
+        }
+        Ok(self)
     }
 }
 
@@ -231,9 +251,16 @@ impl Serialize for f32 {
     }
 }
 
+/// Rounds to the nearest `f32`, as any conversion to `f32` must (0.1 has no exact `f32`), but
+/// a finite number too large for `f32` is an error rather than becoming infinity.
 impl Deserialize for f32 {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        f64::deserialize(v).map(|f| f as f32)
+        let f = f64::deserialize(v)?;
+        let g = f as f32;
+        if f.is_finite() && g.is_infinite() {
+            return Err(Error::new(format!("{f:e} is out of range for f32")));
+        }
+        Ok(g)
     }
 }
 
@@ -302,6 +329,8 @@ impl<T: Deserialize> Deserialize for Box<T> {
     }
 }
 
+/// `None` is null, and so null always reads back as `None`: `Some(None)` in an
+/// `Option<Option<T>>`, or `Some(())`, can't be told apart from `None`.
 impl<T: Serialize> Serialize for Option<T> {
     fn serialize(&self) -> Value {
         self.as_ref().map_or(Value::Null, Serialize::serialize)
@@ -349,6 +378,14 @@ impl<T: Deserialize> Deserialize for Vec<T> {
     }
 }
 
+impl<T: Deserialize, const N: usize> Deserialize for [T; N] {
+    fn deserialize(v: &Value) -> Result<Self, Error> {
+        let items = Vec::<T>::deserialize(v)?;
+        let len = items.len();
+        items.try_into().map_err(|_| Error::new(format!("expected {N} elements, found {len}")))
+    }
+}
+
 /// A byte buffer that serializes as [`Value::Bytes`] (compact in binary, `!!binary` in YAML)
 /// instead of as a sequence of integers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -372,6 +409,8 @@ impl Deserialize for Bytes {
 /// Read a map key. Formats differ in what keys can be (JSON keys are always strings, YAML keys
 /// are typed), so a key that doesn't fit `K` is retried as text, or text as a scalar:
 /// `{"1": x}` reads into `HashMap<u32, _>`, and YAML `{1: x}` into `HashMap<String, _>`.
+/// Text is only read as a scalar when it's the scalar's canonical text (`10`, not `010`,
+/// `+10` or `0xA`), so two different keys can't turn into the same one.
 fn map_key<K: Deserialize>(key: &Value) -> Result<K, Error> {
     match K::deserialize(key) {
         Ok(k) => Ok(k),
@@ -379,7 +418,8 @@ fn map_key<K: Deserialize>(key: &Value) -> Result<K, Error> {
             let retry = match key.untagged() {
                 Value::String(s) => match yaml::resolve_plain(s) {
                     Value::String(_) => return Err(e),
-                    scalar => scalar,
+                    scalar if scalar.key_text() == *s => scalar,
+                    _ => return Err(e),
                 },
                 Value::Seq(_) | Value::Map(_) | Value::Bytes(_) => return Err(e),
                 scalar => Value::String(scalar.key_text()),
@@ -404,12 +444,21 @@ impl<K: Serialize, V: Serialize> Serialize for BTreeMap<K, V> {
     }
 }
 
+fn duplicate_key(k: &Value) -> Error {
+    Error::new("duplicate key (two keys in the input read as the same key)").in_key(&k.key_text())
+}
+
 impl<K: Deserialize + Ord, V: Deserialize> Deserialize for BTreeMap<K, V> {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        if v.as_map().is_none() {
-            return Err(Error::expected("a map", v));
+        let Some(pairs) = v.as_map() else { return Err(Error::expected("a map", v)) };
+        let mut out = BTreeMap::new();
+        for ((raw, _), entry) in pairs.iter().zip(map_entries(v)) {
+            let (k, item) = entry?;
+            if out.insert(k, item).is_some() {
+                return Err(duplicate_key(raw));
+            }
         }
-        map_entries(v).collect()
+        Ok(out)
     }
 }
 
@@ -424,10 +473,15 @@ impl<K: Serialize + Ord, V: Serialize, S> Serialize for HashMap<K, V, S> {
 
 impl<K: Deserialize + Eq + Hash, V: Deserialize, S: BuildHasher + Default> Deserialize for HashMap<K, V, S> {
     fn deserialize(v: &Value) -> Result<Self, Error> {
-        if v.as_map().is_none() {
-            return Err(Error::expected("a map", v));
+        let Some(pairs) = v.as_map() else { return Err(Error::expected("a map", v)) };
+        let mut out = HashMap::with_capacity_and_hasher(pairs.len(), S::default());
+        for ((raw, _), entry) in pairs.iter().zip(map_entries(v)) {
+            let (k, item) = entry?;
+            if out.insert(k, item).is_some() {
+                return Err(duplicate_key(raw));
+            }
         }
-        map_entries(v).collect()
+        Ok(out)
     }
 }
 

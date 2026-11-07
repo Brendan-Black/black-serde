@@ -108,6 +108,14 @@ impl Error {
         self
     }
 
+    /// Note that the error happened at `prefix` (outermost first), all at once. Adding a deep
+    /// path one segment at a time with [`in_key`](Error::in_key) would take quadratic time.
+    pub(crate) fn in_path(mut self, mut prefix: Vec<Segment>) -> Self {
+        prefix.append(&mut self.path);
+        self.path = prefix;
+        self
+    }
+
     pub fn message(&self) -> &str {
         &self.message
     }
@@ -120,11 +128,17 @@ impl Error {
         self.position
     }
 
-    /// The path as text, e.g. `events[3].x`.
+    /// The path as text, e.g. `events[3].x`. A key that would be misread there (empty, or
+    /// holding `.`, `[`, `]`, `"`, or whitespace) is written quoted in brackets: `a["b.c"]`.
     pub fn path_string(&self) -> String {
         let mut out = String::new();
         for seg in &self.path {
             match seg {
+                Segment::Key(k) if k.is_empty() || k.chars().any(|c| ".[]\"".contains(c) || c.is_whitespace() || c.is_control()) => {
+                    out.push('[');
+                    crate::json::write_string(&mut out, k);
+                    out.push(']');
+                }
                 Segment::Key(k) => {
                     if !out.is_empty() {
                         out.push('.');

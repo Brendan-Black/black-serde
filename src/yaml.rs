@@ -13,7 +13,9 @@
 //! How YAML maps onto the data model:
 //!
 //! - Untagged plain scalars resolve with the 1.2 core schema (`null`/`~`/empty, booleans,
-//!   decimal/`0x`/`0o` integers, floats including `.inf` and `.nan`); quoted and block scalars
+//!   decimal/`0x`/`0o` integers, floats including `.inf` and `.nan//! - multi-line strings as literal block scalars (`|`);
+//! - strings quoted whenever a reader could take them for something else, including YAML 1.1
+//!   readers (`"no"`, `"on"`, `"1_000"`); quoted and block scalars
 //!   are strings.
 //! - An alias becomes a copy of its anchored value. An alias inside its own anchor would make a
 //!   cycle, which a [`Value`] tree can't hold, so it's an error. Expanding more than
@@ -33,12 +35,18 @@
 //!
 //! Block style, with:
 //!
-//! - repeated subtrees written once with an anchor and referred to with aliases afterwards
-//!   (`defaults: &defaults {...}` ... `base: *defaults`); see [`Yaml::anchors`];
 //! - multi-line strings as literal block scalars (`|`);
+//! - strings quoted whenever a reader could take them for something else, including YAML 1.1
+//!   readers (`"no"`, `"on"`, `"1_000"`);
 //! - bytes as `!!binary` base64; tags as shorthand (`!point`, `!!set`) or verbatim (`!<...>`);
-//! - keys that aren't scalars as explicit `? key` entries;
-//! - [`Yaml::flow_from`] to write deep containers in flow style, one `{t: 0, x: 5}` per line.
+//! - keys that aren't scalars, or are longer than 1024 characters, as explicit `? key` entries;
+//! - [`Yaml::flow_from`] to write deep containers in flow style, one `{t: 0, x: 5}` per line;
+//! - optionally, with [`Yaml::anchors`], repeated subtrees written once with an anchor and
+//!   referred to with aliases afterwards (`defaults: &defaults {...}` ... `base: *defaults`).
+//!
+//! Writing fails rather than produce text that wouldn't read back as the same value: tags YAML
+//! readers would apply rather than keep (`!!int`, `!`) are errors unless [`YamlLossy`] allows
+//! dropping them.
 //!
 //! # Tokens
 //!
@@ -50,8 +58,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
-use crate::tokens::{check_prefix_free, check_start, check_text};
-use crate::{Deserialize, Error, Format, KeyIndex, Limit, Limits, Serialize, Value, count_values, hash_value, same, walk};
+use crate::tokens::{check_no_self_overlap, check_prefix_free, check_start, check_text};
+use crate::{Deserialize, Error, Format, KeyIndex, Limit, Limits, Serialize, Value, copy_cost, hash_value, same, walk};
 
 /// The default limit on nesting; see [`Limits`]. Reading and writing don't recurse, so this
 /// is a policy, not a protection for the stack.
@@ -185,6 +193,7 @@ impl YamlTokens {
             "which would read as an escape after '\\'",
         )?;
         check_start("YAML", "tag", self.tag, "<", "which starts a verbatim tag after the tag token")?;
+        check_no_self_overlap("YAML", "double_quote", self.double_quote)?;
         Ok(())
     }
 }
@@ -203,8 +212,10 @@ impl Default for YamlTokens {
 /// [`Unrepresentable`](crate::ErrorKind::Unrepresentable)) unless allowed here.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct YamlLossy {
-    /// Tags YAML has no room for, dropped: a second tag on the same value (YAML gives each
-    /// value one), a tag on bytes (which need `!!binary`), and empty tags.
+    /// Tags that wouldn't read back as written, dropped: a second tag on the same value (YAML
+    /// gives each value one), a tag on bytes (which need `!!binary`), empty tags and `!`, and
+    /// standard tags that readers apply rather than keep (`!!int`, `!!seq`, ...) or that don't
+    /// fit the value (`!!set` on a mapping with values).
     pub extra_tags: bool,
 }
 
@@ -238,7 +249,7 @@ impl Default for Yaml {
         Yaml {
             indent: 2,
             flow_from_depth: None,
-            anchor_min_size: Some(3),
+            anchor_min_size: None,
             block_strings: true,
             merge_keys: true,
             lossy: YamlLossy::NONE,
@@ -293,16 +304,16 @@ impl Yaml {
         self
     }
 
-    /// Use these limits instead of the defaults and environment variables.
+    /// Use these limits instead of the defaults ([`Limits::YAML`]).
     pub fn with_limits(mut self, limits: Limits) -> Self {
         self.limits = Some(limits);
         self
     }
 
-    /// The limits reading uses: those set with [`with_limits`](Yaml::with_limits), or else the
-    /// defaults with any environment variables applied.
-    pub fn limits(&self) -> Result<Limits, Error> {
-        self.limits.map_or_else(|| Limits::from_env("YAML", Limits::YAML), Ok)
+    /// The limits reading and writing use: those set with [`with_limits`](Yaml::with_limits),
+    /// or else [`Limits::YAML`].
+    pub fn limits(&self) -> Limits {
+        self.limits.unwrap_or(Limits::YAML)
     }
 
     /// Use a different token set, after checking it.
@@ -342,25 +353,21 @@ impl Yaml {
     /// Check, without recursing, that `value` can be written: not too deep, and every tag
     /// writable. The writer can then assume both.
     fn check_writable(&self, value: &Value) -> Result<(), Error> {
-        let max_depth = self.limits()?.max_depth;
+        let max_depth = self.limits().max_depth;
         let allow = self.lossy.extra_tags;
-        walk(value, max_depth, "YAML", |v| {
+        walk(value, max_depth, |v| {
             let Value::Tagged(tag, inner) = v else { return Ok(()) };
-            let problem = if tag.is_empty() {
-                "an empty tag"
-            } else if matches!(**inner, Value::Tagged(..)) {
-                "a second tag on the same value (YAML allows one)"
-            } else if matches!(**inner, Value::Bytes(_)) {
-                "a tag on bytes (they need the !!binary tag)"
+            let problem = if matches!(**inner, Value::Tagged(..)) {
+                Some("a second tag on the same value (YAML allows one)".to_string())
             } else {
-                return Ok(());
+                tag_problem(tag, inner)
             };
-            if allow {
-                return Ok(());
+            match problem {
+                Some(problem) if !allow => Err(Error::unrepresentable(format!(
+                    "YAML can't write {problem} (allow dropping such tags with YamlLossy::extra_tags)"
+                ))),
+                _ => Ok(()),
             }
-            Err(Error::unrepresentable(format!(
-                "YAML can't write {problem} (allow dropping the extra tag with YamlLossy::extra_tags)"
-            )))
         })
     }
 
@@ -391,9 +398,44 @@ impl Format for Yaml {
     }
 
     fn decode(&self, input: &[u8]) -> Result<Value, Error> {
+        self.limits().check_input(input.len())?;
         let text = std::str::from_utf8(input)
             .map_err(|e| Error::new("YAML input is not valid UTF-8").at_offset(e.valid_up_to()))?;
         self.read(text)
+    }
+}
+
+/// Why `tag` on `content` (untagged) wouldn't read back as written, if it wouldn't. Readers
+/// give the standard tags meaning (`!!int` converts, `!!seq` is just a sequence), so only the
+/// ones they keep as tags can be written as tags.
+fn tag_problem(tag: &str, content: &Value) -> Option<String> {
+    if tag.is_empty() {
+        return Some("an empty tag".into());
+    }
+    if tag == "!" {
+        return Some("the tag \"!\" (it reads back as no tag)".into());
+    }
+    if matches!(content, Value::Bytes(_)) {
+        return Some("a tag on bytes (they need the !!binary tag)".into());
+    }
+    let core = tag.strip_prefix(CORE_TAG_PREFIX)?;
+    let collection = matches!(content, Value::Seq(_) | Value::Map(_));
+    let applied = || Some(format!("the standard tag !!{core}, which readers apply rather than keep"));
+    let wrong = || Some(format!("the standard tag !!{core} on {}", content.kind()));
+    match core {
+        "str" | "null" | "bool" | "int" | "float" | "binary" | "merge" | "seq" | "map" | "omap" => applied(),
+        "set" => match content {
+            Value::Map(pairs) if pairs.iter().all(|(_, v)| v.is_null()) => None,
+            _ => Some("a !!set that isn't a mapping with null values".into()),
+        },
+        "pairs" => match content {
+            Value::Seq(items) if items.iter().all(|i| i.as_map().is_some_and(|m| m.len() == 1) && i.tag().is_none()) => None,
+            _ => Some("a !!pairs that isn't a sequence of single-pair mappings".into()),
+        },
+        "timestamp" if collection => wrong(),
+        _ if collection || matches!(content, Value::String(_)) => None,
+        // Readers keep other standard tags on scalars, but around the text as a string.
+        _ => wrong(),
     }
 }
 
@@ -675,6 +717,7 @@ impl<'a> Planner<'a> {
 /// recursive writer would.
 enum Task<'a> {
     Text(&'static str),
+    Owned(String),
     Newline(usize),
     /// A value in flow style.
     Flow(&'a Value),
@@ -753,6 +796,7 @@ impl<'a> Writer<'a> {
         while let Some(task) = tasks.pop() {
             match task {
                 Task::Text(s) => self.out.push_str(s),
+                Task::Owned(s) => self.out.push_str(&s),
                 Task::Newline(col) => self.newline(col),
                 Task::Flow(v) => self.flow(v, &mut tasks),
                 Task::Block { c, col, depth } => self.block(c, col, depth, &mut tasks),
@@ -793,7 +837,8 @@ impl<'a> Writer<'a> {
             p.push_str(name);
         }
         let tag = match v {
-            Value::Tagged(tag, _) if !tag.is_empty() => Some(self.tag_text(tag)),
+            // Tags that wouldn't read back are dropped (check_writable allowed that).
+            Value::Tagged(tag, inner) if tag_problem(tag, inner.untagged()).is_none() => Some(self.tag_text(tag)),
             _ if matches!(v.untagged(), Value::Bytes(_)) => Some(format!("{0}{0}binary", t.tag)),
             _ => None,
         };
@@ -879,7 +924,7 @@ impl<'a> Writer<'a> {
     fn block_key(&mut self, k: &'a Value, col: usize) {
         let t = *self.t();
         let text = self.flow_text(k);
-        if implicit_key(k) && text.len() <= 1024 {
+        if implicit_key(k) && text.chars().count() <= MAX_IMPLICIT_KEY {
             self.out.push_str(&text);
             self.out.push_str(t.value);
             return;
@@ -999,13 +1044,17 @@ impl<'a> Writer<'a> {
                     tasks.push(Task::Flow(item));
                     tasks.push(Task::Text(" "));
                     tasks.push(Task::Text(t.value));
-                    if implicit_key(k) {
-                        tasks.push(Task::Flow(k));
-                    } else {
-                        tasks.push(Task::Text(" "));
-                        tasks.push(Task::Flow(k));
-                        tasks.push(Task::Text(" "));
-                        tasks.push(Task::Text(t.key));
+                    // A scalar key is written now, to check its length: an implicit key can't be
+                    // longer than 1024 characters. (Writing scalars never recurses.)
+                    let scalar = implicit_key(k).then(|| self.flow_text(k));
+                    match scalar {
+                        Some(text) if text.chars().count() <= MAX_IMPLICIT_KEY => tasks.push(Task::Owned(text)),
+                        _ => {
+                            tasks.push(Task::Text(" "));
+                            tasks.push(scalar.map_or(Task::Flow(k), Task::Owned));
+                            tasks.push(Task::Text(" "));
+                            tasks.push(Task::Text(t.key));
+                        }
                     }
                     if i > 0 {
                         tasks.push(Task::Text(" "));
@@ -1049,6 +1098,10 @@ impl<'a> Writer<'a> {
                 c if c.is_control() => {
                     let _ = write!(self.out, "\\x{:02X}", c as u32);
                 }
+                // Characters YAML doesn't allow in its text (U+FFFE, U+FFFF).
+                c if !is_printable(c) => {
+                    let _ = write!(self.out, "\\u{:04X}", c as u32);
+                }
                 c => self.out.push(c),
             }
             rest = &rest[c.len_utf8()..];
@@ -1056,6 +1109,9 @@ impl<'a> Writer<'a> {
         self.out.push_str(dq);
     }
 }
+
+/// The longest an implicit key (`key: value`) may be, in characters.
+const MAX_IMPLICIT_KEY: usize = 1024;
 
 /// Keys that can be written as `key: value`; others use the explicit `? key` form.
 fn implicit_key(k: &Value) -> bool {
@@ -1067,7 +1123,7 @@ fn literal_eligible(s: &str) -> bool {
     s.contains('\n')
         && !s.starts_with([' ', '\t', '\n'])
         && !s.chars().any(|c| {
-            (c.is_control() && c != '\n' && c != '\t') || matches!(c, '\u{FEFF}' | '\u{2028}' | '\u{2029}')
+            (c.is_control() && c != '\n' && c != '\t') || matches!(c, '\u{FEFF}' | '\u{2028}' | '\u{2029}') || !is_printable(c)
         })
 }
 
@@ -1083,7 +1139,7 @@ fn plain_text_ok(s: &str, t: &YamlTokens) -> bool {
     }
     let flow = t.flow();
     for (i, c) in s.char_indices() {
-        if c.is_control() || matches!(c, '\u{FEFF}' | '\u{2028}' | '\u{2029}') {
+        if c.is_control() || !is_printable(c) || matches!(c, '\u{FEFF}' | '\u{2028}' | '\u{2029}') {
             return false;
         }
         let rest = &s[i..];
@@ -1104,7 +1160,33 @@ fn plain_text_ok(s: &str, t: &YamlTokens) -> bool {
 
 /// Whether the string `s` can be written plain: safe text that also resolves to a string.
 fn plain_ok(s: &str, t: &YamlTokens) -> bool {
-    plain_text_ok(s, t) && s != "<<" && matches!(resolve_plain(s), Value::String(_))
+    plain_text_ok(s, t) && s != "<<" && matches!(resolve_plain(s), Value::String(_)) && !yaml_1_1_scalar(s)
+}
+
+/// Text that YAML 1.1 readers (still common: PyYAML, older libraries) would read as something
+/// other than a string, although 1.2 reads it as one: `yes`, `no`, `on`, `off`, and
+/// numbers with `_`, `0b`, a leading `0`, or `:` (`1_000`, `0b101`, `012`, `1:30`). Writing
+/// these quoted keeps them strings for every reader.
+fn yaml_1_1_scalar(s: &str) -> bool {
+    // Not `y` and `n`: PyYAML reads them as strings, and quoting every `y` coordinate would
+    // be a high price for the few readers that don't.
+    const WORDS: [&str; 4] = ["yes", "no", "on", "off"];
+    if WORDS.iter().any(|w| s.eq_ignore_ascii_case(w)) {
+        return true;
+    }
+    let body = s.strip_prefix(['-', '+']).unwrap_or(s);
+    body.starts_with(|c: char| c.is_ascii_digit() || c == '.')
+        && body.chars().all(|c| c.is_ascii_hexdigit() || "_:.+-xXoObB".contains(c))
+}
+
+/// Whether YAML allows the character in its text (others must be escaped in a double-quoted
+/// string): tab, line breaks, and printable Unicode except the BOM-like U+FFFE and U+FFFF.
+fn is_printable(c: char) -> bool {
+    matches!(c, '\t' | '\n' | '\r' | '\u{85}')
+        || (' '..='~').contains(&c)
+        || ('\u{A0}'..='\u{D7FF}').contains(&c)
+        || ('\u{E000}'..='\u{FFFD}').contains(&c)
+        || c >= '\u{10000}'
 }
 
 /// Percent-encode the characters a tag can't hold as they are.
@@ -1197,55 +1279,54 @@ struct SimpleKey {
     tab: Option<Mark>,
 }
 
-/// The token set as characters.
+/// The token set, with the indicators that count wherever they appear gathered up.
 struct Toks {
-    seq_entry: Vec<char>,
-    key: Vec<char>,
-    value: Vec<char>,
-    flow_entry: Vec<char>,
-    flow_seq_open: Vec<char>,
-    flow_seq_close: Vec<char>,
-    flow_map_open: Vec<char>,
-    flow_map_close: Vec<char>,
-    comment: Vec<char>,
-    anchor: Vec<char>,
-    alias: Vec<char>,
-    tag: Vec<char>,
-    literal: Vec<char>,
-    folded: Vec<char>,
-    single_quote: Vec<char>,
-    double_quote: Vec<char>,
-    directive: Vec<char>,
-    doc_start: Vec<char>,
-    doc_end: Vec<char>,
+    seq_entry: &'static str,
+    key: &'static str,
+    value: &'static str,
+    flow_entry: &'static str,
+    flow_seq_open: &'static str,
+    flow_seq_close: &'static str,
+    flow_map_open: &'static str,
+    flow_map_close: &'static str,
+    comment: &'static str,
+    anchor: &'static str,
+    alias: &'static str,
+    tag: &'static str,
+    literal: &'static str,
+    folded: &'static str,
+    single_quote: &'static str,
+    double_quote: &'static str,
+    directive: &'static str,
+    doc_start: &'static str,
+    doc_end: &'static str,
     /// Every indicator that counts wherever it appears.
-    inline: Vec<Vec<char>>,
+    inline: Vec<&'static str>,
 }
 
 impl Toks {
     fn new(t: &YamlTokens) -> Self {
-        let c = |s: &str| s.chars().collect::<Vec<char>>();
         Toks {
-            seq_entry: c(t.seq_entry),
-            key: c(t.key),
-            value: c(t.value),
-            flow_entry: c(t.flow_entry),
-            flow_seq_open: c(t.flow_seq_open),
-            flow_seq_close: c(t.flow_seq_close),
-            flow_map_open: c(t.flow_map_open),
-            flow_map_close: c(t.flow_map_close),
-            comment: c(t.comment),
-            anchor: c(t.anchor),
-            alias: c(t.alias),
-            tag: c(t.tag),
-            literal: c(t.literal),
-            folded: c(t.folded),
-            single_quote: c(t.single_quote),
-            double_quote: c(t.double_quote),
-            directive: c(t.directive),
-            doc_start: c(t.doc_start),
-            doc_end: c(t.doc_end),
-            inline: t.inline().iter().map(|(_, s)| c(s)).collect(),
+            seq_entry: t.seq_entry,
+            key: t.key,
+            value: t.value,
+            flow_entry: t.flow_entry,
+            flow_seq_open: t.flow_seq_open,
+            flow_seq_close: t.flow_seq_close,
+            flow_map_open: t.flow_map_open,
+            flow_map_close: t.flow_map_close,
+            comment: t.comment,
+            anchor: t.anchor,
+            alias: t.alias,
+            tag: t.tag,
+            literal: t.literal,
+            folded: t.folded,
+            single_quote: t.single_quote,
+            double_quote: t.double_quote,
+            directive: t.directive,
+            doc_start: t.doc_start,
+            doc_end: t.doc_end,
+            inline: t.inline().iter().map(|(_, s)| *s).collect(),
         }
     }
 }
@@ -1267,13 +1348,30 @@ fn is_breakz(c: char) -> bool {
     is_break(c) || c == '\0'
 }
 
+/// Hex digits and nothing else (`from_str_radix` would also take a sign).
+fn parse_hex(s: &str) -> Option<u32> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(s, 16).ok()
+}
+
 /// Turns text into tokens, following the structure of libyaml's scanner: block structure
 /// becomes explicit start/end tokens, and a key token is inserted before a scalar (or flow
 /// collection, anchor, tag) once the ':' after it is found.
-struct Scanner {
-    chars: Vec<char>,
+///
+/// It reads the text in place: positions are byte offsets into it, so scanning needs no
+/// copy of the input.
+struct Scanner<'a> {
+    src: &'a str,
+    /// The byte offset of the next character.
     pos: usize,
+    /// The number of characters before `pos`, used to measure keys in characters.
+    chars_before: usize,
+    /// The byte offset where the current line starts.
+    line_start: usize,
     line: usize,
+    /// The column in characters.
     col: usize,
     tk: Toks,
     done: bool,
@@ -1299,18 +1397,12 @@ struct Scanner {
     checked_line: usize,
 }
 
-impl Scanner {
-    fn new(text: &str, tokens: &YamlTokens) -> Result<Self, Error> {
+impl<'a> Scanner<'a> {
+    fn new(text: &'a str, tokens: &YamlTokens) -> Result<Self, Error> {
         let text = text.strip_prefix('\u{FEFF}').unwrap_or(text);
-        let chars: Vec<char> = text.chars().collect();
         let (mut line, mut col) = (0, 0);
-        for &c in &chars {
-            let printable = matches!(c, '\t' | '\n' | '\r' | '\u{85}')
-                || (' '..='~').contains(&c)
-                || ('\u{A0}'..='\u{D7FF}').contains(&c)
-                || ('\u{E000}'..='\u{FFFD}').contains(&c)
-                || c >= '\u{10000}';
-            if !printable {
+        for c in text.chars() {
+            if !is_printable(c) {
                 return Err(error_at(
                     Mark { line, col },
                     format!("the character U+{:04X} isn't allowed in YAML (write it as an escape in a double-quoted string)", c as u32),
@@ -1324,8 +1416,10 @@ impl Scanner {
             }
         }
         Ok(Scanner {
-            chars,
+            src: text,
             pos: 0,
+            chars_before: 0,
+            line_start: 0,
             line: 0,
             col: 0,
             tk: Toks::new(tokens),
@@ -1389,15 +1483,27 @@ impl Scanner {
     // --- characters ---
 
     fn peek_c(&self) -> char {
-        self.peek_at(0)
+        self.src[self.pos..].chars().next().unwrap_or('\0')
     }
 
-    fn peek_at(&self, n: usize) -> char {
-        self.chars.get(self.pos + n).copied().unwrap_or('\0')
+    /// The character `off` bytes ahead, or `\0` past the end (or inside a character, which
+    /// callers only reach when what they're looking for isn't there anyway).
+    fn peek_at(&self, off: usize) -> char {
+        self.src.get(self.pos + off..).and_then(|s| s.chars().next()).unwrap_or('\0')
+    }
+
+    /// The length in bytes of the character `off` bytes ahead (1 past the end).
+    fn char_len_at(&self, off: usize) -> usize {
+        self.peek_at(off).len_utf8()
+    }
+
+    /// The character before this point, or `\0` at the start.
+    fn prev_c(&self) -> char {
+        self.src[..self.pos].chars().next_back().unwrap_or('\0')
     }
 
     fn at_end(&self) -> bool {
-        self.pos >= self.chars.len()
+        self.pos >= self.src.len()
     }
 
     fn mark(&self) -> Mark {
@@ -1409,22 +1515,29 @@ impl Scanner {
     }
 
     fn forward(&mut self) {
-        match self.peek_c() {
-            '\n' => {
-                self.line += 1;
-                self.col = 0;
-            }
-            '\r' if self.peek_at(1) != '\n' => {
-                self.line += 1;
-                self.col = 0;
-            }
+        let c = self.peek_c();
+        if c == '\0' {
+            return;
+        }
+        self.pos += c.len_utf8();
+        self.chars_before += 1;
+        match c {
+            '\n' => self.new_line(),
+            '\r' if self.peek_c() != '\n' => self.new_line(),
             _ => self.col += 1,
         }
-        self.pos += 1;
     }
 
+    fn new_line(&mut self) {
+        self.line += 1;
+        self.col = 0;
+        self.line_start = self.pos;
+    }
+
+    /// Move forward `n` bytes (always a whole number of characters).
     fn forward_n(&mut self, n: usize) {
-        for _ in 0..n {
+        let end = self.pos + n;
+        while self.pos < end && !self.at_end() {
             self.forward();
         }
     }
@@ -1440,22 +1553,23 @@ impl Scanner {
         }
     }
 
-    fn at_off(&self, off: usize, t: &[char]) -> bool {
-        t.iter().enumerate().all(|(i, c)| self.peek_at(off + i) == *c)
+    /// The token starts `off` bytes ahead.
+    fn at_off(&self, off: usize, t: &str) -> bool {
+        self.src.get(self.pos + off..).is_some_and(|s| s.starts_with(t))
     }
 
-    fn at(&self, t: &[char]) -> bool {
-        self.at_off(0, t)
+    fn at(&self, t: &str) -> bool {
+        self.src[self.pos..].starts_with(t)
     }
 
     /// The token here, followed by a blank or the end.
-    fn spaced(&self, t: &[char]) -> bool {
+    fn spaced(&self, t: &str) -> bool {
         self.at(t) && is_blankz(self.peek_at(t.len()))
     }
 
     fn flow_indicator_at(&self, off: usize) -> bool {
         let t = &self.tk;
-        [&t.flow_entry, &t.flow_seq_open, &t.flow_seq_close, &t.flow_map_open, &t.flow_map_close]
+        [t.flow_entry, t.flow_seq_open, t.flow_seq_close, t.flow_map_open, t.flow_map_close]
             .iter()
             .any(|f| self.at_off(off, f))
     }
@@ -1464,17 +1578,18 @@ impl Scanner {
         if self.col != 0 {
             return None;
         }
-        if self.spaced(&self.tk.doc_start) {
+        if self.spaced(self.tk.doc_start) {
             Some(K::DocStart)
-        } else if self.spaced(&self.tk.doc_end) {
+        } else if self.spaced(self.tk.doc_end) {
             Some(K::DocEnd)
         } else {
             None
         }
     }
 
+    /// The next `n` bytes as a string, moving past them.
     fn take_chars(&mut self, n: usize) -> String {
-        let s: String = self.chars[self.pos..self.pos + n].iter().collect();
+        let s = self.src[self.pos..self.pos + n].to_string();
         self.forward_n(n);
         s
     }
@@ -1482,7 +1597,7 @@ impl Scanner {
     /// Only blanks come before this point on the line. Checked from here backwards, so it
     /// stops at the first character on a long line rather than scanning it all.
     fn in_indentation(&self) -> bool {
-        self.chars[self.pos - self.col..self.pos].iter().rev().all(|&c| is_blank(c))
+        self.src[self.line_start..self.pos].bytes().rev().all(|b| b == b' ' || b == b'\t')
     }
 
     // --- dispatch ---
@@ -1490,15 +1605,16 @@ impl Scanner {
     /// Everything before this point on the line is blanks and block indicators (`- `, `? `,
     /// `: `), so whitespace here works as indentation.
     fn only_indicators_before(&self) -> bool {
-        let mut i = self.pos - self.col;
+        let bytes = self.src.as_bytes();
+        let mut i = self.line_start;
         'scan: while i < self.pos {
-            if is_blank(self.chars[i]) {
+            if bytes[i] == b' ' || bytes[i] == b'\t' {
                 i += 1;
                 continue;
             }
-            for t in [&self.tk.seq_entry, &self.tk.key, &self.tk.value] {
+            for t in [self.tk.seq_entry, self.tk.key, self.tk.value] {
                 let end = i + t.len();
-                if end <= self.pos && self.chars[i..end] == t[..] && self.chars.get(end).is_some_and(|&c| is_blank(c)) {
+                if end <= self.pos && self.src[i..].starts_with(t) && matches!(bytes.get(end), Some(b' ' | b'\t')) {
                     i = end;
                     continue 'scan;
                 }
@@ -1520,8 +1636,8 @@ impl Scanner {
                 }
                 self.forward();
             }
-            if self.at(&self.tk.comment) {
-                if self.pos > 0 && !is_blankz(self.chars[self.pos - 1]) {
+            if self.at(self.tk.comment) {
+                if self.pos > 0 && !is_blankz(self.prev_c()) {
                     return Err(self.error("a comment needs a space before it"));
                 }
                 while !is_breakz(self.peek_c()) {
@@ -1546,7 +1662,7 @@ impl Scanner {
 
     /// The number of spaces at the start of the current line.
     fn leading_spaces(&self) -> usize {
-        self.chars[self.pos - self.col..].iter().take_while(|&&c| c == ' ').count()
+        self.src[self.line_start..].bytes().take_while(|&b| b == b' ').count()
     }
 
     fn fetch_more(&mut self) -> Result<(), Error> {
@@ -1557,7 +1673,7 @@ impl Scanner {
             return self.fetch_stream_end();
         }
         if self.col == 0 {
-            if self.at(&self.tk.directive) {
+            if self.at(self.tk.directive) {
                 return self.fetch_directive();
             }
             if let Some(kind) = self.at_doc_marker() {
@@ -1570,28 +1686,28 @@ impl Scanner {
             return Err(self.error("this line of a flow collection must be indented more than the block it's in"));
         }
         let tk = &self.tk;
-        if self.at(&tk.flow_seq_open) {
+        if self.at(tk.flow_seq_open) {
             return self.fetch_flow_start(K::FlowSeqStart, tk.flow_seq_open.len());
         }
-        if self.at(&tk.flow_map_open) {
+        if self.at(tk.flow_map_open) {
             return self.fetch_flow_start(K::FlowMapStart, tk.flow_map_open.len());
         }
-        if self.at(&tk.flow_seq_close) {
+        if self.at(tk.flow_seq_close) {
             return self.fetch_flow_end(K::FlowSeqEnd, tk.flow_seq_close.len());
         }
-        if self.at(&tk.flow_map_close) {
+        if self.at(tk.flow_map_close) {
             return self.fetch_flow_end(K::FlowMapEnd, tk.flow_map_close.len());
         }
-        if self.at(&tk.flow_entry) {
+        if self.at(tk.flow_entry) {
             return self.fetch_flow_entry();
         }
-        if self.spaced(&tk.seq_entry) {
+        if self.spaced(tk.seq_entry) {
             return self.fetch_block_entry();
         }
-        if self.spaced(&tk.key) {
+        if self.spaced(tk.key) {
             return self.fetch_key();
         }
-        if self.at(&tk.value) {
+        if self.at(tk.value) {
             let after = tk.value.len();
             if is_blankz(self.peek_at(after))
                 || (self.flow_level > 0 && (self.flow_indicator_at(after) || self.adjacent_value))
@@ -1599,25 +1715,25 @@ impl Scanner {
                 return self.fetch_value();
             }
         }
-        if self.at(&tk.alias) {
+        if self.at(tk.alias) {
             return self.fetch_anchor(K::Alias);
         }
-        if self.at(&tk.anchor) {
+        if self.at(tk.anchor) {
             return self.fetch_anchor(K::Anchor);
         }
-        if self.at(&tk.tag) {
+        if self.at(tk.tag) {
             return self.fetch_tag();
         }
-        if self.flow_level == 0 && self.at(&tk.literal) {
+        if self.flow_level == 0 && self.at(tk.literal) {
             return self.fetch_block_scalar(false);
         }
-        if self.flow_level == 0 && self.at(&tk.folded) {
+        if self.flow_level == 0 && self.at(tk.folded) {
             return self.fetch_block_scalar(true);
         }
-        if self.at(&tk.single_quote) {
+        if self.at(tk.single_quote) {
             return self.fetch_quoted(false);
         }
-        if self.at(&tk.double_quote) {
+        if self.at(tk.double_quote) {
             return self.fetch_quoted(true);
         }
         if self.check_plain() {
@@ -1627,7 +1743,7 @@ impl Scanner {
         if c == '@' || c == '`' {
             return Err(self.error(format!("'{c}' is reserved and can't start a value (quote the value)")));
         }
-        Err(self.error(format!("unexpected '{}' here", self.chars[self.pos..].iter().take_while(|c| !is_blankz(**c)).take(8).collect::<String>())))
+        Err(self.error(format!("unexpected '{}' here", self.src[self.pos..].chars().take_while(|c| !is_blankz(*c)).take(8).collect::<String>())))
     }
 
     /// Whether a plain scalar starts here.
@@ -1675,7 +1791,7 @@ impl Scanner {
     /// rule only needs checking when the line changes.
     fn stale_simple_keys(&mut self) -> Result<(), Error> {
         while let Some((level, k)) = self.oldest_key() {
-            if self.pos <= k.index + 1024 {
+            if self.chars_before <= k.index + MAX_IMPLICIT_KEY {
                 break;
             }
             self.stale(level, k)?;
@@ -1712,8 +1828,8 @@ impl Scanner {
             self.remove_simple_key()?;
             let token_number = self.tokens_taken + self.tokens.len();
             self.simple_keys[self.flow_level] =
-                Some(SimpleKey { token_number, required, index: self.pos, mark: self.mark(), tab: self.tab_mark });
-            self.key_order.push_back((self.flow_level, self.pos));
+                Some(SimpleKey { token_number, required, index: self.chars_before, mark: self.mark(), tab: self.tab_mark });
+            self.key_order.push_back((self.flow_level, self.chars_before));
         }
         Ok(())
     }
@@ -1812,8 +1928,8 @@ impl Scanner {
         while is_blank(self.peek_c()) {
             self.forward();
         }
-        if self.at(&self.tk.comment) {
-            if !is_blank(self.chars[self.pos - 1]) {
+        if self.at(self.tk.comment) {
+            if !is_blank(self.prev_c()) {
                 return Err(self.error("a comment needs a space before it"));
             }
             while !is_breakz(self.peek_c()) {
@@ -1848,7 +1964,7 @@ impl Scanner {
     /// A tag handle in a %TAG directive, returned in standard form.
     fn directive_handle(&mut self) -> Result<String, Error> {
         let tag_len = self.tk.tag.len();
-        if !self.at(&self.tk.tag) {
+        if !self.at(self.tk.tag) {
             return Err(self.error("expected a tag handle"));
         }
         self.forward_n(tag_len);
@@ -1857,7 +1973,7 @@ impl Scanner {
             name.push(self.peek_c());
             self.forward();
         }
-        if self.at(&self.tk.tag) {
+        if self.at(self.tk.tag) {
             self.forward_n(tag_len);
             return Ok(format!("!{name}!"));
         }
@@ -2002,7 +2118,7 @@ impl Scanner {
         self.forward_n(len);
         let mut n = 0;
         while !is_blankz(self.peek_at(n)) && !self.flow_indicator_at(n) {
-            n += 1;
+            n += self.char_len_at(n);
         }
         if n == 0 {
             let what = if kind == K::Alias { "an alias" } else { "an anchor" };
@@ -2039,11 +2155,11 @@ impl Scanner {
             let mut n = 0;
             let mut named = false;
             while !ends(self, n) {
-                if self.at_off(n, &self.tk.tag) {
+                if self.at_off(n, self.tk.tag) {
                     named = true;
                     break;
                 }
-                n += 1;
+                n += self.char_len_at(n);
             }
             if named {
                 let name = self.take_chars(n);
@@ -2072,13 +2188,13 @@ impl Scanner {
         let mut bytes = Vec::new();
         loop {
             let c = self.peek_c();
-            if !verbatim && (self.flow_indicator_at(0) || self.at(&self.tk.tag)) {
+            if !verbatim && (self.flow_indicator_at(0) || self.at(self.tk.tag)) {
                 break;
             }
             let ok = c.is_ascii_alphanumeric() || "-;/?:@&=+$_.~*'()#".contains(c) || "!,[]".contains(c);
             if c == '%' {
                 let hex: String = [self.peek_at(1), self.peek_at(2)].iter().collect();
-                let b = u8::from_str_radix(&hex, 16).map_err(|_| self.error("invalid %XX escape in a tag"))?;
+                let b = parse_hex(&hex).and_then(|n| u8::try_from(n).ok()).ok_or_else(|| self.error("invalid %XX escape in a tag"))?;
                 bytes.push(b);
                 self.forward_n(3);
             } else if ok {
@@ -2121,8 +2237,8 @@ impl Scanner {
         while is_blank(self.peek_c()) {
             self.forward();
         }
-        if self.at(&self.tk.comment) {
-            if !is_blank(self.chars[self.pos - 1]) {
+        if self.at(self.tk.comment) {
+            if !is_blank(self.prev_c()) {
                 return Err(self.error("a comment needs a space before it"));
             }
             while !is_breakz(self.peek_c()) {
@@ -2152,7 +2268,7 @@ impl Scanner {
             while !is_breakz(self.peek_c()) {
                 self.forward();
             }
-            out.extend(&self.chars[start..self.pos]);
+            out.push_str(&self.src[start..self.pos]);
             // The end of the input ends the last line just as a line break would.
             if is_break(self.peek_c()) {
                 self.line_break();
@@ -2270,26 +2386,26 @@ impl Scanner {
     }
 
     fn quoted(&mut self, double: bool, start: Mark) -> Result<String, Error> {
-        let quote = if double { self.tk.double_quote.clone() } else { self.tk.single_quote.clone() };
+        let quote = if double { self.tk.double_quote } else { self.tk.single_quote };
         self.forward_n(quote.len());
         let mut out = String::new();
-        self.quoted_non_blanks(double, &quote, &mut out)?;
-        while !self.at(&quote) {
+        self.quoted_non_blanks(double, quote, &mut out)?;
+        while !self.at(quote) {
             self.quoted_blanks(&mut out, start)?;
-            self.quoted_non_blanks(double, &quote, &mut out)?;
+            self.quoted_non_blanks(double, quote, &mut out)?;
         }
         self.forward_n(quote.len());
         Ok(out)
     }
 
-    fn quoted_non_blanks(&mut self, double: bool, quote: &[char], out: &mut String) -> Result<(), Error> {
+    fn quoted_non_blanks(&mut self, double: bool, quote: &str, out: &mut String) -> Result<(), Error> {
         loop {
             if self.at_end() {
                 return Ok(());
             }
             if self.at(quote) {
                 if !double && self.at_off(quote.len(), quote) {
-                    out.extend(quote);
+                    out.push_str(quote);
                     self.forward_n(quote.len() * 2);
                     continue;
                 }
@@ -2299,7 +2415,7 @@ impl Scanner {
             if double && c == '\\' {
                 self.forward();
                 if self.at(quote) {
-                    out.extend(quote);
+                    out.push_str(quote);
                     self.forward_n(quote.len());
                     continue;
                 }
@@ -2336,7 +2452,7 @@ impl Scanner {
                             _ => 8,
                         };
                         let hex: String = (1..=n).map(|i| self.peek_at(i)).collect();
-                        let code = u32::from_str_radix(&hex, 16).map_err(|_| self.error("invalid hex escape"))?;
+                        let code = parse_hex(&hex).ok_or_else(|| self.error("invalid hex escape"))?;
                         let ch = char::from_u32(code).ok_or_else(|| self.error("escape is not a valid character"))?;
                         self.forward_n(n);
                         ch
@@ -2372,7 +2488,7 @@ impl Scanner {
                 out.push_str(&breaks);
             }
         } else {
-            out.extend(&self.chars[begin..self.pos]);
+            out.push_str(&self.src[begin..self.pos]);
         }
         Ok(())
     }
@@ -2419,7 +2535,7 @@ impl Scanner {
         let mut crossed = false;
         let mut multiline = false;
         loop {
-            if self.at(&self.tk.comment) {
+            if self.at(self.tk.comment) {
                 break;
             }
             let start = self.pos;
@@ -2428,7 +2544,7 @@ impl Scanner {
                 if is_blankz(c) {
                     break;
                 }
-                if self.at(&self.tk.value) {
+                if self.at(self.tk.value) {
                     let after = self.tk.value.len();
                     if is_blankz(self.peek_at(after)) || (self.flow_level > 0 && self.flow_indicator_at(after)) {
                         break;
@@ -2445,9 +2561,9 @@ impl Scanner {
             self.allow_simple_key = false;
             multiline |= crossed;
             out.push_str(&spaces);
-            out.extend(&self.chars[start..self.pos]);
+            out.push_str(&self.src[start..self.pos]);
             (spaces, crossed) = self.plain_spaces(indent);
-            if spaces.is_empty() || self.at(&self.tk.comment) || (self.flow_level == 0 && (self.col as isize) < indent) {
+            if spaces.is_empty() || self.at(self.tk.comment) || (self.flow_level == 0 && (self.col as isize) < indent) {
                 break;
             }
         }
@@ -2463,7 +2579,7 @@ impl Scanner {
             self.forward();
         }
         if !is_break(self.peek_c()) {
-            return (self.chars[begin..self.pos].iter().collect(), false);
+            return (self.src[begin..self.pos].to_string(), false);
         }
         self.line_break();
         self.allow_simple_key = true;
@@ -2519,7 +2635,7 @@ impl MapEntries {
         if self.index.find(&self.pairs, &key).is_some() {
             return Err(error_at(m, format!("duplicate key \"{}\"", key.key_text())));
         }
-        self.index.insert(&key, self.pairs.len());
+        self.index.insert(&self.pairs, &key, self.pairs.len());
         self.pairs.push((key, value));
         Ok(())
     }
@@ -2540,7 +2656,7 @@ impl MapEntries {
                 if index.find(&pairs, &k).is_some() || merged_index.find(&merged_keys, &k).is_some() {
                     continue;
                 }
-                merged_index.insert(&k, merged_keys.len());
+                merged_index.insert(&merged_keys, &k, merged_keys.len());
                 merged_keys.push((k.clone(), Value::Null));
                 kept.push((k, v));
             }
@@ -2625,7 +2741,10 @@ impl Open {
     fn add(&mut self, key: Value, value: Value, merge: bool, m: Mark) -> Result<(), Error> {
         self.want = Want::Item;
         if matches!(self.kind, Kind::FlowSeq { .. }) {
-            self.items.push(Value::Map(vec![(key, value)]));
+            // A single-pair mapping, with a merge key applied like any other.
+            let mut pair = MapEntries::default();
+            pair.add(key, value, merge, m)?;
+            self.items.push(pair.finish());
             Ok(())
         } else {
             self.entries.add(key, value, merge, m)
@@ -2637,14 +2756,17 @@ fn top(stack: &mut [Open]) -> &mut Open {
     stack.last_mut().expect("an open collection")
 }
 
-struct Composer {
-    sc: Scanner,
+struct Composer<'a> {
+    sc: Scanner<'a>,
     tokens: YamlTokens,
     merge_keys: bool,
     limits: Limits,
     anchors: HashMap<String, (Value, usize)>,
     open_anchors: Vec<String>,
     expanded: usize,
+    /// Values copied so far to remember anchored nodes, and how many may be.
+    anchor_copies: usize,
+    max_anchor_copies: usize,
     handles: Vec<(String, String)>,
     /// The node just composed was a plain `<<` scalar (or tagged `!!merge`).
     last_merge: bool,
@@ -2653,10 +2775,10 @@ struct Composer {
     last_value: Option<Mark>,
 }
 
-impl Composer {
-    fn new(text: &str, o: &Yaml) -> Result<Self, Error> {
-        let limits = o.limits()?;
-        limits.check_input(text.len(), "YAML")?;
+impl<'a> Composer<'a> {
+    fn new(text: &'a str, o: &Yaml) -> Result<Self, Error> {
+        let limits = o.limits();
+        limits.check_input(text.len())?;
         Ok(Composer {
             sc: Scanner::new(text, &o.tokens)?,
             tokens: o.tokens,
@@ -2665,6 +2787,8 @@ impl Composer {
             anchors: HashMap::new(),
             open_anchors: Vec::new(),
             expanded: 0,
+            anchor_copies: 0,
+            max_anchor_copies: limits.max_alias_values.saturating_add(text.len()),
             handles: Vec::new(),
             last_merge: false,
             started: false,
@@ -2783,6 +2907,7 @@ impl Composer {
         let value = if empty { Value::Null } else { self.compose(true, false)? };
         self.anchors.clear();
         self.expanded = 0;
+        self.anchor_copies = 0;
         let (k, m) = self.peek()?;
         match k {
             K::DocEnd => {
@@ -2795,7 +2920,7 @@ impl Composer {
             other => {
                 return Err(error_at(
                     m,
-                    format!("unexpected {} after the end of the document (check the indentation)", self.describe(other)),
+                    format!("found {} after the end of the document (check the indentation)", self.describe(other)),
                 ));
             }
         }
@@ -3013,12 +3138,11 @@ impl Composer {
         let Some((v, n)) = self.anchors.get(name) else {
             return Err(error_at(m, format!("unknown alias {name:?} (no earlier anchor with that name in this document)")));
         };
-        self.expanded += n;
+        self.expanded = self.expanded.saturating_add(*n);
         if self.expanded > self.limits.max_alias_values {
             let msg = format!(
-                "aliases expand to more than max_alias_values ({}); raise it with with_limits or {}YAML_MAX_ALIAS_VALUES if this document is trusted",
+                "aliases expand to more than max_alias_values ({}); raise it with with_limits if this document is trusted",
                 self.limits.max_alias_values,
-                crate::limits::ENV_PREFIX,
             );
             let e = Error::limit_exceeded(Limit::AliasValues, msg);
             return Err(e.at_line(m.line + 1, m.col + 1));
@@ -3170,22 +3294,35 @@ impl Composer {
             }
             other => return Err(error_at(m, format!("expected a value, found {}", self.describe(other)))),
         };
-        self.remember(props.anchor, &value);
+        self.remember(props.anchor, &value, m)?;
         Ok(value)
     }
 
     #[inline(never)]
     fn finish_node(&mut self, props: Props, value: Value, m: Mark) -> Result<Value, Error> {
         let value = self.collection(value, props.tag.as_deref(), m)?;
-        self.remember(props.anchor, &value);
+        self.remember(props.anchor, &value, m)?;
         Ok(value)
     }
 
-    fn remember(&mut self, anchor: Option<String>, value: &Value) {
-        if let Some(a) = anchor {
-            self.open_anchors.pop();
-            self.anchors.insert(a, (value.clone(), count_values(value)));
+    /// Keep a copy of an anchored value for its aliases. Copies are counted: nested anchors
+    /// copy the same values again at every level, so without a limit a small input could
+    /// fill memory without a single alias. Each copy may cost up to `max_alias_values` plus
+    /// the input's size, so remembering everything once (or twice) is always fine.
+    fn remember(&mut self, anchor: Option<String>, value: &Value, m: Mark) -> Result<(), Error> {
+        let Some(a) = anchor else { return Ok(()) };
+        self.open_anchors.pop();
+        let cost = copy_cost(value);
+        self.anchor_copies = self.anchor_copies.saturating_add(cost);
+        if self.anchor_copies > self.max_anchor_copies {
+            let msg = format!(
+                "anchored values copy more than max_alias_values ({}) plus the input's size; raise max_alias_values with with_limits if this document is trusted",
+                self.limits.max_alias_values,
+            );
+            return Err(Error::limit_exceeded(Limit::AliasValues, msg).at_line(m.line + 1, m.col + 1));
         }
+        self.anchors.insert(a, (value.clone(), cost));
+        Ok(())
     }
 
     #[cold]
@@ -3196,7 +3333,7 @@ impl Composer {
         let kind = |seq: bool| if seq { "sequence" } else { "mapping" };
         let msg = match f {
             Fail::TooDeep => {
-                let e = self.limits.depth_error("YAML");
+                let e = self.limits.depth_error();
                 return e.at_line(m.line + 1, m.col + 1);
             }
             Fail::Unterminated { seq } => format!("unterminated flow {} (missing '{}')", kind(seq), close(seq)),
