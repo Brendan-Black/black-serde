@@ -7,7 +7,7 @@ use black_serde::json::Json;
 use black_serde::{Format, Limit, Limits, Value};
 
 fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-	std::thread::Builder::new().stack_size(1 << 20).spawn(f).unwrap().join().unwrap()
+	std::thread::Builder::new().stack_size(1 << 20).spawn(f).expect("spawning the small-stack thread").join().expect("the small-stack thread panicked")
 }
 
 /// `[[[...[1]...]]]`, nested `depth` times, built without recursion.

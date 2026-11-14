@@ -24,7 +24,7 @@
 //! # Ok::<(), black_serde::Error>(())
 //! ```
 
-use std::fmt::{self, Write as _};
+use std::fmt;
 
 use crate::tokens::{check_no_self_overlap, check_prefix_free, check_start, check_text};
 use crate::{Deserialize, Error, Format, KeyIndex, Limits, Segment, Serialize, Value};
@@ -321,10 +321,10 @@ fn write_document(out: &mut String, root: &Value, opts: &Json, max_depth: usize)
 				Value::Null => out.push_str(t.null),
 				Value::Bool(b) => out.push_str(if *b { t.bool_true } else { t.bool_false }),
 				Value::Int(i) => {
-					let _ = write!(out, "{i}");
+					out.push_str(&format!("{i}"));
 				}
 				Value::UInt(u) => {
-					let _ = write!(out, "{u}");
+					out.push_str(&format!("{u}"));
 				}
 				Value::Float(f) if !f.is_finite() => {
 					if !lossy.non_finite_floats {
@@ -336,7 +336,7 @@ fn write_document(out: &mut String, root: &Value, opts: &Json, max_depth: usize)
 				// Debug formatting is the shortest text that round-trips, and keeps a ".0" or
 				// an exponent so the number reads back as a float.
 				Value::Float(f) => {
-					let _ = write!(out, "{f:?}");
+					out.push_str(&format!("{f:?}"));
 				}
 				Value::String(s) => write_string_with(out, s, t),
 				Value::Bytes(bytes) => {
@@ -349,7 +349,7 @@ fn write_document(out: &mut String, root: &Value, opts: &Json, max_depth: usize)
 						if i > 0 {
 							out.push_str(t.comma);
 						}
-						let _ = write!(out, "{b}");
+						out.push_str(&format!("{b}"));
 					}
 					out.push_str(t.seq_close);
 				}
@@ -470,7 +470,7 @@ fn write_string_with(out: &mut String, s: &str, t: &JsonTokens) {
 			'\u{0C}' => out.push_str("\\f"),
 			// Control characters, plus the two line separators JavaScript treats as newlines.
 			c if (c as u32) < 0x20 || c == '\u{2028}' || c == '\u{2029}' => {
-				let _ = write!(out, "\\u{:04x}", c as u32);
+				out.push_str(&format!("\\u{:04x}", c as u32));
 			}
 			c => out.push(c),
 		}

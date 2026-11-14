@@ -55,7 +55,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 
 use crate::tokens::{check_no_self_overlap, check_prefix_free, check_start, check_text};
@@ -998,15 +997,15 @@ impl<'a> Writer<'a> {
 			Value::Null => self.out.push_str("null"),
 			Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
 			Value::Int(i) => {
-				let _ = write!(self.out, "{i}");
+				self.out.push_str(&format!("{i}"));
 			}
 			Value::UInt(u) => {
-				let _ = write!(self.out, "{u}");
+				self.out.push_str(&format!("{u}"));
 			}
 			Value::Float(f) if f.is_nan() => self.out.push_str(".nan"),
 			Value::Float(f) if f.is_infinite() => self.out.push_str(if *f > 0.0 { ".inf" } else { "-.inf" }),
 			Value::Float(f) => {
-				let _ = write!(self.out, "{f:?}");
+				self.out.push_str(&format!("{f:?}"));
 			}
 			Value::String(s) => self.string(s),
 			Value::Bytes(b) => {
@@ -1089,11 +1088,11 @@ impl<'a> Writer<'a> {
 				'\u{2029}' => self.out.push_str("\\P"),
 				'\u{FEFF}' => self.out.push_str("\\uFEFF"),
 				c if c.is_control() => {
-					let _ = write!(self.out, "\\x{:02X}", c as u32);
+					self.out.push_str(&format!("\\x{:02X}", c as u32));
 				}
 				// Characters YAML doesn't allow in its text (U+FFFE, U+FFFF).
 				c if !is_printable(c) => {
-					let _ = write!(self.out, "\\u{:04X}", c as u32);
+					self.out.push_str(&format!("\\u{:04X}", c as u32));
 				}
 				c => self.out.push(c),
 			}
@@ -1189,7 +1188,7 @@ fn escape_tag(s: &str, verbatim: bool) -> String {
 		} else {
 			let mut buf = [0u8; 4];
 			for b in c.encode_utf8(&mut buf).bytes() {
-				let _ = write!(out, "%{b:02X}");
+				out.push_str(&format!("%{b:02X}"));
 			}
 		}
 	}

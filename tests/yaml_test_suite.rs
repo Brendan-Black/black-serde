@@ -29,7 +29,8 @@ fn cases(dir: &Path, out: &mut Vec<PathBuf>) {
 		out.push(dir.to_path_buf());
 		return;
 	}
-	let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
+	let mut entries: Vec<_> =
+		std::fs::read_dir(dir).unwrap_or_else(|e| panic!("reading {}: {e}", dir.display())).flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
 	entries.sort();
 	for e in entries {
 		if !e.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.')) {
@@ -84,7 +85,7 @@ fn json_stream(text: &str) -> Vec<Value> {
 				}
 			}
 		}
-		values.push(black_serde::json::parse(&text[start..i]).unwrap());
+		values.push(black_serde::json::parse(&text[start..i]).unwrap_or_else(|e| panic!("the suite's expected JSON doesn't parse: {e}")));
 	}
 }
 
@@ -92,7 +93,7 @@ fn json_stream(text: &str) -> Vec<Value> {
 /// in key order (JSON objects are unordered).
 fn normalize(v: &Value) -> Value {
 	match v.untagged() {
-		Value::Int(_) | Value::UInt(_) | Value::Float(_) => Value::Float(v.as_f64().unwrap()),
+		Value::Int(_) | Value::UInt(_) | Value::Float(_) => Value::Float(v.as_f64().expect("every number is an f64")),
 		Value::Seq(items) => Value::Seq(items.iter().map(normalize).collect()),
 		Value::Map(pairs) => {
 			let mut pairs: Vec<_> = pairs.iter().map(|(k, v)| (Value::String(k.key_text()), normalize(v))).collect();
