@@ -195,3 +195,7 @@ pub trait Format {
 ```
 
 Then `black_serde::to_bytes(&MyFormat, &thing)` and `from_bytes` work for every type.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
