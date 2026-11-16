@@ -65,6 +65,13 @@ use crate::{Deserialize, Error, Format, KeyIndex, Limit, Limits, Serialize, Valu
 pub const MAX_DEPTH: usize = 256;
 /// The prefix of the standard tags, which `!!` abbreviates.
 pub const CORE_TAG_PREFIX: &str = "tag:yaml.org,2002:";
+/// The plain scalar for null, as read and as written.
+const NULL: &str = "null";
+/// The plain scalar for not-a-number, as written; read in any of its three spellings.
+const NAN: &str = ".nan";
+/// The anchor-name hints for a sequence's items, and for a map's values whose key isn't a string.
+const ITEM_HINT: &str = "item";
+const VALUE_HINT: &str = "value";
 
 // ---------- tokens ----------
 
@@ -154,10 +161,15 @@ impl YamlTokens {
 		[("seq_entry", self.seq_entry), ("key", self.key), ("value", self.value)]
 	}
 
+	/// The document markers.
+	fn markers(&self) -> [(&'static str, &'static str); 2] {
+		[("doc_start", self.doc_start), ("doc_end", self.doc_end)]
+	}
+
 	fn all(&self) -> Vec<(&'static str, &'static str)> {
 		let mut v = self.inline();
 		v.extend(self.spaced());
-		v.extend([("doc_start", self.doc_start), ("doc_end", self.doc_end)]);
+		v.extend(self.markers());
 		v
 	}
 
@@ -171,9 +183,9 @@ impl YamlTokens {
 		check_prefix_free("YAML", &indicators)?;
 		// Document markers only count at the start of a line before a space, so they may share
 		// a prefix with other indicators (`-` and `---`), but not be one.
-		check_prefix_free("YAML", &[("doc_start", self.doc_start), ("doc_end", self.doc_end)])?;
+		check_prefix_free("YAML", &self.markers())?;
 		for (name, tok) in &indicators {
-			for (mname, marker) in [("doc_start", self.doc_start), ("doc_end", self.doc_end)] {
+			for (mname, marker) in self.markers() {
 				if tok == &marker {
 					return check_prefix_free("YAML", &[(name, tok), (mname, marker)]);
 				}
@@ -456,12 +468,12 @@ pub fn parse_all(text: &str) -> Result<Vec<Value>, Error> {
 /// Resolve an untagged plain scalar with the core schema.
 pub(crate) fn resolve_plain(s: &str) -> Value {
 	match s {
-		"" | "~" | "null" | "Null" | "NULL" => return Value::Null,
+		"" | "~" | NULL | "Null" | "NULL" => return Value::Null,
 		"true" | "True" | "TRUE" => return Value::Bool(true),
 		"false" | "False" | "FALSE" => return Value::Bool(false),
 		".inf" | ".Inf" | ".INF" | "+.inf" | "+.Inf" | "+.INF" => return Value::Float(f64::INFINITY),
 		"-.inf" | "-.Inf" | "-.INF" => return Value::Float(f64::NEG_INFINITY),
-		".nan" | ".NaN" | ".NAN" => return Value::Float(f64::NAN),
+		NAN | ".NaN" | ".NAN" => return Value::Float(f64::NAN),
 		_ => {}
 	}
 	if let Some(hex) = s.strip_prefix("0x")
@@ -675,8 +687,8 @@ impl<'a> Planner<'a> {
 			}
 			self.seen.entry(hash).or_default().push((v, hint));
 			match content {
-				Value::Seq(items) => stack.extend(items.iter().rev().map(|i| (i, "item"))),
-				Value::Map(pairs) => stack.extend(pairs.iter().rev().map(|(k, i)| (i, k.as_str().unwrap_or("value")))),
+				Value::Seq(items) => stack.extend(items.iter().rev().map(|i| (i, ITEM_HINT))),
+				Value::Map(pairs) => stack.extend(pairs.iter().rev().map(|(k, i)| (i, k.as_str().unwrap_or(VALUE_HINT)))),
 				_ => {}
 			}
 		}
@@ -994,7 +1006,7 @@ impl<'a> Writer<'a> {
 			self.out.push(' ');
 		}
 		match v.untagged() {
-			Value::Null => self.out.push_str("null"),
+			Value::Null => self.out.push_str(NULL),
 			Value::Bool(b) => self.out.push_str(if *b { "true" } else { "false" }),
 			Value::Int(i) => {
 				self.out.push_str(&format!("{i}"));
@@ -1002,7 +1014,7 @@ impl<'a> Writer<'a> {
 			Value::UInt(u) => {
 				self.out.push_str(&format!("{u}"));
 			}
-			Value::Float(f) if f.is_nan() => self.out.push_str(".nan"),
+			Value::Float(f) if f.is_nan() => self.out.push_str(NAN),
 			Value::Float(f) if f.is_infinite() => self.out.push_str(if *f > 0.0 { ".inf" } else { "-.inf" }),
 			Value::Float(f) => {
 				self.out.push_str(&format!("{f:?}"));

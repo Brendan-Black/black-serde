@@ -70,46 +70,33 @@ impl JsonTokens {
 	/// Check that the set can be read back unambiguously.
 	pub fn check(&self) -> Result<(), Error> {
 		let t = self;
-		let all = [
-			("map_open", t.map_open),
-			("map_close", t.map_close),
-			("seq_open", t.seq_open),
-			("seq_close", t.seq_close),
-			("comma", t.comma),
-			("colon", t.colon),
-			("string_open", t.string_open),
-			("string_close", t.string_close),
-			("null", t.null),
-			("bool_true", t.bool_true),
-			("bool_false", t.bool_false),
-		];
+		// Each token with the name errors call it by, once.
+		let (map_open, map_close) = (("map_open", t.map_open), ("map_close", t.map_close));
+		let (seq_open, seq_close) = (("seq_open", t.seq_open), ("seq_close", t.seq_close));
+		let (comma, colon) = (("comma", t.comma), ("colon", t.colon));
+		let (string_open, string_close) = (("string_open", t.string_open), ("string_close", t.string_close));
+		let (null, bool_true, bool_false) = (("null", t.null), ("bool_true", t.bool_true), ("bool_false", t.bool_false));
+		let all = [map_open, map_close, seq_open, seq_close, comma, colon, string_open, string_close, null, bool_true, bool_false];
 		for (name, tok) in all {
 			check_text("JSON", name, tok)?;
 		}
 		// Where a value can start (including right after seq_open, where seq_close can too).
-		let value_start = [
-			("map_open", t.map_open),
-			("seq_open", t.seq_open),
-			("string_open", t.string_open),
-			("null", t.null),
-			("bool_true", t.bool_true),
-			("bool_false", t.bool_false),
-		];
+		let value_start = [map_open, seq_open, string_open, null, bool_true, bool_false];
 		let mut first = value_start.to_vec();
-		first.push(("seq_close", t.seq_close));
+		first.push(seq_close);
 		check_prefix_free("JSON", &first)?;
-		for (name, tok) in value_start.iter().chain(&[("seq_close", t.seq_close), ("map_close", t.map_close)]) {
+		for (name, tok) in value_start.iter().chain(&[seq_close, map_close]) {
 			check_start("JSON", name, tok, "-0123456789", "which starts a number")?;
 		}
-		check_prefix_free("JSON", &[("string_open", t.string_open), ("map_close", t.map_close)])?;
-		check_prefix_free("JSON", &[("comma", t.comma), ("seq_close", t.seq_close)])?;
-		check_prefix_free("JSON", &[("comma", t.comma), ("map_close", t.map_close)])?;
+		check_prefix_free("JSON", &[string_open, map_close])?;
+		check_prefix_free("JSON", &[comma, seq_close])?;
+		check_prefix_free("JSON", &[comma, map_close])?;
 		// Tokens that can follow a number must not look like more of the number.
-		for (name, tok) in [("comma", t.comma), ("seq_close", t.seq_close), ("map_close", t.map_close)] {
+		for (name, tok) in [comma, seq_close, map_close] {
 			check_start("JSON", name, tok, "0123456789.eE+-", "which would continue a number")?;
 		}
-		check_start("JSON", "string_close", t.string_close, "\\/bfnrtu", "which would read as an escape after '\\'")?;
-		check_no_self_overlap("JSON", "string_close", t.string_close)?;
+		check_start("JSON", string_close.0, string_close.1, "\\/bfnrtu", "which would read as an escape after '\\'")?;
+		check_no_self_overlap("JSON", string_close.0, string_close.1)?;
 		Ok(())
 	}
 }
